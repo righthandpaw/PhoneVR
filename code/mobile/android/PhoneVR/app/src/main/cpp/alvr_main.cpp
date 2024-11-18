@@ -112,13 +112,74 @@ AlvrFov getFov(CardboardEye eye) {
 
 AlvrPose getPose(uint64_t timestampNs) {
     AlvrPose pose = {};
+    bool returnLastPosition = false;
 
-    float pos[3];
-    float q[4];
-    CardboardHeadTracker_getPose(CTX.headTracker, (int64_t) timestampNs, kLandscapeLeft, pos, q);
+    if (!CTX.arcoreEnabled || (CTX.arcoreEnabled && !useARCoreOrientation)) {
+        float pos[3];
+        float q[4];
+        CardboardHeadTracker_getPose(CTX.headTracker, (int64_t) timestampNs, kLandscapeLeft, pos, q);
 
-    auto inverseOrientation = AlvrQuat{q[0], q[1], q[2], q[3]};
-    pose.orientation = inverseQuat(inverseOrientation);
+        auto inverseOrientation = AlvrQuat{q[0], q[1], q[2], q[3]};
+        pose.orientation = inverseQuat(inverseOrientation);
+        CTX.lastOrientation = pose.orientation;
+    }
+
+    if (CTX.arcoreEnabled && CTX.arSession != nullptr) {
+        if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
+            throw std::runtime_error("Failed to get EGL context in getPose.");
+            returnLastPosition = false;
+            goto out;
+        }
+
+        int ret = ArSession_update(CTX.arSession, CTX.arFrame);
+        if (ret != AR_SUCCESS) {
+            error("getPose: ArSession_update failed (%d), using last position", ret);
+            returnLastPosition = true;
+            goto out;
+        }
+
+        ArCamera *arCamera = nullptr;
+        ArFrame_acquireCamera(CTX.arSession, CTX.arFrame, &arCamera);
+
+        ArTrackingState arTrackingState;
+        ArCamera_getTrackingState(CTX.arSession, arCamera, &arTrackingState);
+        if (arTrackingState != AR_TRACKING_STATE_TRACKING) {
+            error("getPose: Camera is not tracking, using last position");
+            returnLastPosition = true;
+            ArCamera_release(arCamera);
+            goto out;
+        }
+
+        ArPose *arPose = nullptr;
+        ArPose_create(CTX.arSession, nullptr, &arPose);
+        ArCamera_getPose(CTX.arSession, arCamera, arPose);
+        // ArPose_getPoseRaw() returns a pose in {qx, qy, qz, qw, tx, ty, tz} format.
+        float arRawPose[7] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        ArPose_getPoseRaw(CTX.arSession, arPose, arRawPose);
+
+        for (int i = 0; i < 3; i++) {
+            pose.position[i] = arRawPose[i + 4];
+            CTX.lastPosition[i] = arRawPose[i + 4];
+        }
+
+        if (useARCoreOrientation) {
+            auto orientation = AlvrQuat{arRawPose[0], arRawPose[1], arRawPose[2],
+                                               arRawPose[3]};
+            pose.orientation = orientation;
+            CTX.lastOrientation = pose.orientation;
+        }
+
+        ArPose_destroy(arPose);
+        ArCamera_release(arCamera);
+    }
+
+out:
+    if (returnLastPosition) {
+        pose.orientation = CTX.lastOrientation;
+        for (int i = 0; i < 3; i++) {
+            pose.position[i] = CTX.lastPosition[i];
+        }
+    }
 
     return pose;
 }
@@ -194,6 +255,37 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_initia
 
     Cardboard_initializeAndroid(CTX.javaVm, CTX.javaContext);
     CTX.headTracker = CardboardHeadTracker_create();
+
+    CTX.arcoreEnabled = (bool) enableARCore;
+    if (CTX.arcoreEnabled) {
+        if (ArSession_create(env, CTX.javaContext, &CTX.arSession) != AR_SUCCESS) {
+            error("initializeNative: Could not create ARCore session");
+            CTX.arcoreEnabled = false;
+            return;
+        }
+
+        ArConfig* arConfig = nullptr;
+        ArConfig_create(CTX.arSession, &arConfig);
+
+        // Explicitly disable all unnecessary features to preserve CPU power.
+        ArConfig_setDepthMode(CTX.arSession, arConfig, AR_DEPTH_MODE_DISABLED);
+        ArConfig_setLightEstimationMode(CTX.arSession, arConfig, AR_LIGHT_ESTIMATION_MODE_DISABLED);
+        ArConfig_setPlaneFindingMode(CTX.arSession, arConfig, AR_PLANE_FINDING_MODE_HORIZONTAL_AND_VERTICAL);
+
+        // Set "latest camera image" update mode (ArSession_update returns immediately without blocking)
+        ArConfig_setUpdateMode(CTX.arSession, arConfig, AR_UPDATE_MODE_LATEST_CAMERA_IMAGE);
+
+        // TODO: Add camera config filter:
+        // https://developers.google.com/ar/develop/c/camera-configs
+
+        if (ArSession_configure(CTX.arSession, arConfig) != AR_SUCCESS) {
+            error("initializeNative: Could not configure ARCore session");
+            return;
+        }
+
+        ArFrame_create(CTX.arSession, &CTX.arFrame);
+    }
+
 }
 
 extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_destroyNative(JNIEnv *,
