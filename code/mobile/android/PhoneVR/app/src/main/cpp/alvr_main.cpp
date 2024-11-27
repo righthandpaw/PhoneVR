@@ -39,8 +39,6 @@ struct NativeContext {
     AlvrQuat lastOrientation = {0.f, 0.f, 0.f, 0.f};
     float lastPosition[3] = {0.f, 0.f, 0.f};
 
-    float currentMagnetometerValues[4] = {0.f, 0.f, 0.f, 0.f};
-
     int screenWidth = 0;
     int screenHeight = 0;
 
@@ -156,6 +154,14 @@ AlvrPose getPose(uint64_t timestampNs) {
         ArCamera_getTrackingState(CTX.arSession, arCamera, &arTrackingState);
         if (arTrackingState != AR_TRACKING_STATE_TRACKING) {
             error("getPose: Camera is not tracking, using last position");
+            if (arTrackingState == AR_TRACKING_STATE_PAUSED) {
+                error("- AR tracking state is PAUSED");
+                ArTrackingFailureReason failureReason;
+                ArCamera_getTrackingFailureReason(CTX.arSession, arCamera, &failureReason);
+                error("- Failure reason: %d", failureReason);
+            } else if (arTrackingState == AR_TRACKING_STATE_STOPPED) {
+                error("- AR tracking state is STOPPED");
+            }
             returnLastPosition = true;
             ArCamera_release(arCamera);
             goto out;
@@ -168,19 +174,12 @@ AlvrPose getPose(uint64_t timestampNs) {
         float arRawPose[7] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
         ArPose_getPoseRaw(CTX.arSession, arPose, arRawPose);
 
-
-        /* We use an anchor here for two things:
-         *
-         * 1. To determine floor position by finding the lowest detected plane. We do this by
+        /* We determine floor position by finding the lowest detected plane. We do this by
          * placing an anchor in the center position of the plane, and if it's lower than the
          * currently placed anchor (CTX.floorAnchor), we replace it.
          *
          * (By default, ARCore's "world coordinates" space begins wherever the device is, but this
-         * can desync over time. Anchor position adapts to world space movement.)
-         *
-         * ~~2. To determine the rotation of world space. This allows us to improve tracking.~~
-         * nevermind, that doesn't seem to work, orientation is stuck :(
-         */
+         * can desync over time. Anchor position adapts to world space movement. */
         ArTrackableList *trackables = nullptr;
         ArTrackableList_create(CTX.arSession, &trackables);
         ArFrame_getUpdatedTrackables(CTX.arSession, CTX.arFrame, AR_TRACKABLE_PLANE, trackables);
@@ -250,7 +249,6 @@ AlvrPose getPose(uint64_t timestampNs) {
             ArPose_getPoseRaw(CTX.arSession, anchorPose, anchorRawPose);
             info("anchor pose %f %f %f %f %f %f %f", anchorRawPose[0], anchorRawPose[1], anchorRawPose[2], anchorRawPose[3], anchorRawPose[4], anchorRawPose[5], anchorRawPose[6]);
         }
-
 
         pose.position[0] = arRawPose[4];
         pose.position[1] = arRawPose[5] - anchorRawPose[5];
@@ -403,6 +401,13 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_destro
 extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_resumeNative(JNIEnv *,
                                                                                        jobject) {
     CardboardHeadTracker_resume(CTX.headTracker);
+
+    if (CTX.arcoreEnabled && CTX.arSession != nullptr) {
+        ArStatus arSessionStatus = ArSession_resume(CTX.arSession);
+        if (arSessionStatus != AR_SUCCESS) {
+            error("Failed to resume tracking: %d", arSessionStatus);
+        }
+    }
 
     CTX.renderingParamsChanged = true;
 
