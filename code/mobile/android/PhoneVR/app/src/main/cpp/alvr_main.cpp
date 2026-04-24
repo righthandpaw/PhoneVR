@@ -280,7 +280,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                 CardboardLensDistortion_create(buffer, size, CTX.screenWidth, CTX.screenHeight);
 
             CardboardQrCode_destroy(buffer);
-            *buffer = 0;
+
 
             if (CTX.distortionRenderer) {
                 CardboardDistortionRenderer_destroy(CTX.distortionRenderer);
