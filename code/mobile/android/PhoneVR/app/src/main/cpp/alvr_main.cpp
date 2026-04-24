@@ -6,6 +6,9 @@
 #include <deque>
 #include <jni.h>
 #include <map>
+#include <atomic>
+#include <chrono>
+#include <mutex>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -21,6 +24,29 @@ uint64_t HEAD_ID = alvr_path_string_to_id("/user/head");
 const uint64_t VSYNC_QUEUE_INTERVAL_NS = 50e6;
 const float FLOOR_HEIGHT = 1.5;
 const int MAXIMUM_TRACKING_FRAMES = 360;
+// Send tracking at display refresh rate (default 60 Hz) rather than 20 Hz to reduce server-side
+// motion-to-photon latency. The divisor below is 1 (full rate); was previously 3.
+const int TRACKING_RATE_DIVISOR = 1;
+
+// ---------------------------------------------------------------------------
+// ATW (Asynchronous TimeWarp) state
+// Stores the head pose used when the *server rendered* the last frame so we
+// can compute a delta to the *current* head pose just before display and warp
+// the Cardboard UV coordinates to compensate for rotational latency.
+// ---------------------------------------------------------------------------
+struct AtwState {
+    // Pose at which the server rendered the last received frame.
+    AlvrQuat renderPose   = {0.f, 0.f, 0.f, 1.f};
+    // Timestamp (boot-time ns) when that frame arrived.
+    int64_t  renderTimeNs = 0;
+    // Simple angular-velocity estimate for pose extrapolation (rad/s, body frame).
+    float    angVel[3]    = {0.f, 0.f, 0.f};
+    // Previous pose used to derive angVel.
+    AlvrQuat prevPose     = {0.f, 0.f, 0.f, 1.f};
+    int64_t  prevTimeNs   = 0;
+
+    std::mutex mtx; // guards all fields above
+};
 
 struct NativeContext {
     JavaVM *javaVm = nullptr;
@@ -48,10 +74,11 @@ struct NativeContext {
     AlvrFov fovArr[2] = {};
     AlvrViewParams viewParams[2] = {};
     AlvrDeviceMotion deviceMotion = {};
-    
-    // Store last decoded frame for reprojection when no new frame arrives
-    void *lastStreamBuffer = nullptr;
-    int64_t lastStreamTimestampNs = -1;
+
+    // ATW state — updated each time a decoded frame arrives.
+    AtwState atw;
+    // Display refresh rate stored at init time (Hz).
+    float refreshRate = 60.f;
 
     NativeContext() {
         memset(&fovArr, 0, (sizeof(fovArr)) / sizeof(int));
@@ -70,6 +97,145 @@ int64_t GetBootTimeNano() {
 
 // Inverse unit quaternion
 AlvrQuat inverseQuat(AlvrQuat q) { return {-q.x, -q.y, -q.z, q.w}; }
+
+// Multiply two unit quaternions: out = a * b
+AlvrQuat quatMul(AlvrQuat a, AlvrQuat b) {
+    return {
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    };
+}
+
+// Normalise a quaternion (guards against FP drift).
+AlvrQuat quatNorm(AlvrQuat q) {
+    float n = sqrtf(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    if (n < 1e-6f) return {0.f, 0.f, 0.f, 1.f};
+    return {q.x/n, q.y/n, q.z/n, q.w/n};
+}
+
+// Rotate a 3-vector by a unit quaternion.
+void quatRotateVec(AlvrQuat q, const float v[3], float out[3]) {
+    // out = q * [0,v] * q^-1  (sandwich product)
+    float tx = 2.f * (q.y * v[2] - q.z * v[1]);
+    float ty = 2.f * (q.z * v[0] - q.x * v[2]);
+    float tz = 2.f * (q.x * v[1] - q.y * v[0]);
+    out[0] = v[0] + q.w * tx + q.y * tz - q.z * ty;
+    out[1] = v[1] + q.w * ty + q.z * tx - q.x * tz;
+    out[2] = v[2] + q.w * tz + q.x * ty - q.y * tx;
+}
+
+// Slerp between two unit quaternions (t in [0,1]).
+AlvrQuat quatSlerp(AlvrQuat a, AlvrQuat b, float t) {
+    float dot = a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
+    if (dot < 0.f) { b = {-b.x, -b.y, -b.z, -b.w}; dot = -dot; }
+    if (dot > 0.9995f) {
+        return quatNorm({a.x + t*(b.x-a.x), a.y + t*(b.y-a.y),
+                         a.z + t*(b.z-a.z), a.w + t*(b.w-a.w)});
+    }
+    float theta0 = acosf(dot);
+    float theta  = theta0 * t;
+    float s0 = cosf(theta) - dot * sinf(theta) / sinf(theta0);
+    float s1 = sinf(theta) / sinf(theta0);
+    return quatNorm({s0*a.x + s1*b.x, s0*a.y + s1*b.y,
+                     s0*a.z + s1*b.z, s0*a.w + s1*b.w});
+}
+
+// ---------------------------------------------------------------------------
+// updateAtwFromFrame: called right after alvr_get_frame() to record the render
+// pose and estimate angular velocity for extrapolation.
+// ---------------------------------------------------------------------------
+void updateAtwFromFrame(const AlvrViewParams &frameViewParams, int64_t nowNs) {
+    std::lock_guard<std::mutex> lock(CTX.atw.mtx);
+
+    AlvrQuat newPose = frameViewParams.pose.orientation;
+    int64_t  dt      = nowNs - CTX.atw.prevTimeNs;
+
+    if (CTX.atw.prevTimeNs > 0 && dt > 0 && dt < (int64_t)100e6 /*100 ms guard*/) {
+        // delta = prevPose^-1 * newPose  (rotation from prev to current in body frame)
+        AlvrQuat delta = quatMul(inverseQuat(CTX.atw.prevPose), newPose);
+        if (delta.w > 1.f)  delta.w = 1.f;
+        if (delta.w < -1.f) delta.w = -1.f;
+        float halfAngle = acosf(fabsf(delta.w));
+        float sinHalf   = sinf(halfAngle);
+        float dtSec     = (float)dt * 1e-9f;
+        if (sinHalf > 1e-6f && dtSec > 0.f) {
+            float rate = (2.f * halfAngle) / dtSec;
+            CTX.atw.angVel[0] = (delta.x / sinHalf) * rate;
+            CTX.atw.angVel[1] = (delta.y / sinHalf) * rate;
+            CTX.atw.angVel[2] = (delta.z / sinHalf) * rate;
+        }
+    }
+
+    CTX.atw.renderPose  = newPose;
+    CTX.atw.renderTimeNs= nowNs;
+    CTX.atw.prevPose    = newPose;
+    CTX.atw.prevTimeNs  = nowNs;
+}
+
+// ---------------------------------------------------------------------------
+// applyAtw: returns a corrected current pose by composing:
+//   1. The delta between renderPose and the latest sensor pose (removes stale
+//      rotation already baked into the frame).
+//   2. Optional short extrapolation using the estimated angular velocity to
+//      pre-correct for the remaining display pipeline delay (~8 ms typical).
+// The Cardboard UV rect is then nudged using the yaw/pitch components.
+// ---------------------------------------------------------------------------
+AlvrQuat applyAtw(AlvrQuat currentPose, CardboardEyeTextureDescription &desc) {
+    AlvrQuat renderPose;
+    float    angVel[3];
+    {
+        std::lock_guard<std::mutex> lock(CTX.atw.mtx);
+        renderPose = CTX.atw.renderPose;
+        angVel[0]  = CTX.atw.angVel[0];
+        angVel[1]  = CTX.atw.angVel[1];
+        angVel[2]  = CTX.atw.angVel[2];
+    }
+
+    // --- Extrapolate currentPose forward by ~half a frame to pre-correct
+    //     for Cardboard's own render-to-display pipeline latency.
+    const float kExtrapolateMs = 8.f; // tune if needed
+    float dt = kExtrapolateMs * 1e-3f;
+    float ax = angVel[0] * dt * 0.5f;
+    float ay = angVel[1] * dt * 0.5f;
+    float az = angVel[2] * dt * 0.5f;
+    float alen = sqrtf(ax*ax + ay*ay + az*az);
+    AlvrQuat extrapolated = currentPose;
+    if (alen > 1e-6f) {
+        float s = sinf(alen) / alen;
+        AlvrQuat dq = { ax*s, ay*s, az*s, cosf(alen) };
+        extrapolated = quatNorm(quatMul(currentPose, dq));
+    }
+
+    // --- Compute rotation delta: renderPose -> extrapolated
+    //     delta = renderPose^-1 * extrapolated
+    AlvrQuat delta = quatNorm(quatMul(inverseQuat(renderPose), extrapolated));
+
+    // --- Convert delta to approximate yaw/pitch angular offsets (small-angle)
+    //     and nudge the Cardboard UV rectangle.  Each full FOV radian ~ 1 UV unit.
+    // Extract axis-angle from delta (small angle: sin(θ/2) ≈ θ/2).
+    float yawOff   =  2.f * delta.y;   // rotation around Y = yaw
+    float pitchOff = -2.f * delta.x;   // rotation around X = pitch (flipped for UV)
+
+    // Map angular offset to UV space: assumes ~90° horizontal FOV -> π/2 rad = 1 UV.
+    // Adjust kFovScale for your actual FOV if needed.
+    const float kFovScale = 1.f / (3.14159f / 2.f);
+    float du = yawOff   * kFovScale * 0.5f;  // *0.5 because each eye covers half the range
+    float dv = pitchOff * kFovScale;
+
+    // Clamp to avoid excessive warping on large delta (frame drop protection).
+    const float kMaxWarp = 0.15f;
+    du = std::max(-kMaxWarp, std::min(kMaxWarp, du));
+    dv = std::max(-kMaxWarp, std::min(kMaxWarp, dv));
+
+    desc.left_u  += du;
+    desc.right_u += du;
+    desc.top_v   += dv;
+    desc.bottom_v+= dv;
+
+    return extrapolated;
+}
 
 void cross(float a[3], float b[3], float out[3]) {
     out[0] = a[1] * b[2] - a[2] * b[1];
@@ -146,16 +312,18 @@ void updateViewConfigs(uint64_t targetTimestampNs = 0) {
 void inputThread() {
     auto deadline = std::chrono::steady_clock::now();
 
-    info("inputThread: thread staring...");
+    info("inputThread: thread starting...");
     while (CTX.streaming) {
-
         auto targetTimestampNs = GetBootTimeNano() + alvr_get_head_prediction_offset_ns();
         updateViewConfigs(targetTimestampNs);
 
         alvr_send_tracking(
             targetTimestampNs, CTX.viewParams, &CTX.deviceMotion, 1, nullptr, nullptr);
 
-        deadline += std::chrono::nanoseconds((uint64_t) (1e9 / 60.f / 3));
+        // Send tracking at full display refresh rate (was /3 = ~20 Hz, now full rate).
+        // This directly reduces motion-to-photon latency on the server side.
+        deadline += std::chrono::nanoseconds(
+            (uint64_t)(1e9f / (CTX.refreshRate * TRACKING_RATE_DIVISOR)));
         std::this_thread::sleep_until(deadline);
     }
 }
@@ -168,6 +336,7 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *) {
 extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_initializeNative(
     JNIEnv *env, jobject obj, jint screenWidth, jint screenHeight, jfloat refreshRate) {
     CTX.javaContext = env->NewGlobalRef(obj);
+    CTX.refreshRate = refreshRate;
 
     uint32_t viewWidth = std::max(screenWidth, screenHeight) / 2;
     uint32_t viewHeight = std::min(screenWidth, screenHeight);
@@ -267,7 +436,6 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             CardboardQrCode_getSavedDeviceParams(&buffer, &size);
 
             if (size == 0) {
-				CardboardQrCode_destroy(buffer);  // must free even when empty
                 return;
             }
 
@@ -281,14 +449,13 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                 CardboardLensDistortion_create(buffer, size, CTX.screenWidth, CTX.screenHeight);
 
             CardboardQrCode_destroy(buffer);
-
+            *buffer = 0;
 
             if (CTX.distortionRenderer) {
                 CardboardDistortionRenderer_destroy(CTX.distortionRenderer);
                 CTX.distortionRenderer = nullptr;
             }
-            const CardboardOpenGlEsDistortionRendererConfig config{kGlTexture2D};
-            CTX.distortionRenderer = CardboardOpenGlEs2DistortionRenderer_create(&config);
+            CTX.distortionRenderer = CardboardOpenGlEs2DistortionRenderer_create();
 
             for (int eye = 0; eye < 2; eye++) {
                 CardboardMesh mesh;
@@ -470,14 +637,10 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             } else if (event.tag == ALVR_EVENT_STREAMING_STOPPED) {
                 info("ALVR Poll Event: ALVR_EVENT_STREAMING_STOPPED, Waiting for inputThread to "
                      "join...");
-                CTX.lastStreamBuffer = nullptr;   // clear reprojection buffer on disconnect
-                CTX.lastStreamTimestampNs = -1;
                 CTX.streaming = false;
                 CTX.inputThread.join();
 
                 GL(glDeleteTextures(2, CTX.streamTextures));
-                CTX.streamTextures[0] = 0;  // zero out so stale handles can't be used
-                CTX.streamTextures[1] = 0;
                 info("ALVR Poll Event: ALVR_EVENT_STREAMING_STOPPED, Stream stopped deleted "
                      "textures.");
             }
@@ -494,33 +657,33 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
         if (CTX.streaming) {
             void *streamHardwareBuffer = nullptr;
 
-            AlvrViewParams dummyViewParams;
-            auto timestampNs = alvr_get_frame(&dummyViewParams, &streamHardwareBuffer);
+            AlvrViewParams frameViewParams;
+            auto timestampNs = alvr_get_frame(&frameViewParams, &streamHardwareBuffer);
 
             if (timestampNs == -1) {
-                // No new decoded frame this cycle.
-                // Instead of returning (which causes a blank/ghost frame), reuse the
-                // last valid buffer — this is basic async reprojection: same image,
-                // but composited with the current head orientation by Cardboard.
-                if (CTX.lastStreamBuffer == nullptr) {
-                    // We truly have no frame yet at all, nothing to show.
-                    return;
-                }
-                streamHardwareBuffer = CTX.lastStreamBuffer;
-                timestampNs = CTX.lastStreamTimestampNs;
-            } else {
-                // New frame arrived — save it for future reprojection cycles.
-                CTX.lastStreamBuffer = streamHardwareBuffer;
-                CTX.lastStreamTimestampNs = timestampNs;
+                return;
             }
+
+            // Record the server-rendered pose and update angular velocity estimate
+            // for ATW. Must happen before alvr_render_stream_opengl so the ATW
+            // correction is ready before we set up the Cardboard descriptors below.
+            int64_t frameArrivalNs = GetBootTimeNano();
+            updateAtwFromFrame(frameViewParams, frameArrivalNs);
 
             uint32_t swapchainIndices[2] = {0, 0};
             alvr_render_stream_opengl(streamHardwareBuffer, swapchainIndices);
 
-            alvr_report_submit(timestampNs, 0);
+            // Pass real display-side timestamp so the server can tune its encoder
+            // bitrate and network pipeline to actual end-to-end latency.
+            alvr_report_submit(timestampNs, (uint64_t)frameArrivalNs);
 
             viewsDescs[0].texture = CTX.streamTextures[0];
             viewsDescs[1].texture = CTX.streamTextures[1];
+
+            // --- ATW: warp each eye's UV rect to compensate for rotational latency ---
+            AlvrQuat latestPose = getPose(GetBootTimeNano()).orientation;
+            applyAtw(latestPose, viewsDescs[0]);
+            applyAtw(latestPose, viewsDescs[1]);
         } else {
             AlvrPose pose = getPose(GetBootTimeNano() + VSYNC_QUEUE_INTERVAL_NS);
 
@@ -540,8 +703,10 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             viewsDescs[1].texture = CTX.lobbyTextures[1];
         }
 
-        // Note: the Cardboard SDK does not support reprojection!
-        // todo: manually implement it?
+        // ATW (Asynchronous TimeWarp) is applied above via UV-rect warping.
+        // A full GPU-based warp pass would require an intermediate FBO + warp shader
+        // but this pose-extrapolation approach covers rotational latency with no extra
+        // render passes, fitting the Cardboard pipeline.
 
         // info("nativeRendered: Rendering to Display...");
         CardboardDistortionRenderer_renderEyeToDisplay(CTX.distortionRenderer,

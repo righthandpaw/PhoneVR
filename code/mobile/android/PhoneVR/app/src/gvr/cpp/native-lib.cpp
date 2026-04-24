@@ -435,9 +435,9 @@ SUB(startMediaCodec)(JNIEnv *env, jclass, jobject surface) {
         AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, maxHeight);
         AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_WIDTH, maxWidth);
         AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_HEIGHT, maxHeight);
-        // AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_LOW_LATENCY, 1); // remove this if doesnt work
+        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_LOW_LATENCY, 1); // remove this if doesnt work
         // AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_FRAME_RATE, 62);
-        // AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, 1000000); //comment if it breaks something.
+        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, 1000000); //comment if it breaks something.
         AMediaFormat_setBuffer(fmt, "csd-0", &vHeader[0], vHeader.size());
 
         codec = AMediaCodec_createDecoderByType("video/avc");
