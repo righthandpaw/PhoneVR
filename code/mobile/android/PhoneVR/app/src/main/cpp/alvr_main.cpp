@@ -267,6 +267,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             CardboardQrCode_getSavedDeviceParams(&buffer, &size);
 
             if (size == 0) {
+				CardboardQrCode_destroy(buffer);  // must free even when empty
                 return;
             }
 
@@ -475,6 +476,8 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                 CTX.inputThread.join();
 
                 GL(glDeleteTextures(2, CTX.streamTextures));
+                CTX.streamTextures[0] = 0;  // zero out so stale handles can't be used
+                CTX.streamTextures[1] = 0;
                 info("ALVR Poll Event: ALVR_EVENT_STREAMING_STOPPED, Stream stopped deleted "
                      "textures.");
             }
