@@ -48,6 +48,10 @@ struct NativeContext {
     AlvrFov fovArr[2] = {};
     AlvrViewParams viewParams[2] = {};
     AlvrDeviceMotion deviceMotion = {};
+    
+    // Store last decoded frame for reprojection when no new frame arrives
+    void *lastStreamBuffer = nullptr;
+    int64_t lastStreamTimestampNs = -1;
 
     NativeContext() {
         memset(&fovArr, 0, (sizeof(fovArr)) / sizeof(int));
@@ -465,6 +469,8 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             } else if (event.tag == ALVR_EVENT_STREAMING_STOPPED) {
                 info("ALVR Poll Event: ALVR_EVENT_STREAMING_STOPPED, Waiting for inputThread to "
                      "join...");
+                CTX.lastStreamBuffer = nullptr;   // clear reprojection buffer on disconnect
+                CTX.lastStreamTimestampNs = -1;
                 CTX.streaming = false;
                 CTX.inputThread.join();
 
@@ -489,7 +495,20 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             auto timestampNs = alvr_get_frame(&dummyViewParams, &streamHardwareBuffer);
 
             if (timestampNs == -1) {
-                return;
+                // No new decoded frame this cycle.
+                // Instead of returning (which causes a blank/ghost frame), reuse the
+                // last valid buffer — this is basic async reprojection: same image,
+                // but composited with the current head orientation by Cardboard.
+                if (CTX.lastStreamBuffer == nullptr) {
+                    // We truly have no frame yet at all, nothing to show.
+                    return;
+                }
+                streamHardwareBuffer = CTX.lastStreamBuffer;
+                timestampNs = CTX.lastStreamTimestampNs;
+            } else {
+                // New frame arrived — save it for future reprojection cycles.
+                CTX.lastStreamBuffer = streamHardwareBuffer;
+                CTX.lastStreamTimestampNs = timestampNs;
             }
 
             uint32_t swapchainIndices[2] = {0, 0};
