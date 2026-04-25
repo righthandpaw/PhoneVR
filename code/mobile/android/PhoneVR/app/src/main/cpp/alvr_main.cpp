@@ -38,6 +38,7 @@ struct NativeContext {
 
     bool running = false;
     bool streaming = false;
+    float displayRefreshRate = 60.0f;
     std::thread inputThread;
 
     // Une one texture per eye, no need for swapchains.
@@ -155,7 +156,7 @@ void inputThread() {
         alvr_send_tracking(
             targetTimestampNs, CTX.viewParams, &CTX.deviceMotion, 1, nullptr, nullptr);
 
-        deadline += std::chrono::nanoseconds((uint64_t) (1e9 / 60.f / 3));
+        deadline += std::chrono::nanoseconds((uint64_t) (1e9 / CTX.displayRefreshRate / 3));
         std::this_thread::sleep_until(deadline);
     }
 }
@@ -189,6 +190,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_initia
     caps.encoder_av1 = true;
 
     alvr_initialize(caps);
+	CTX.displayRefreshRate = refreshRate;
 
     Cardboard_initializeAndroid(CTX.javaVm, CTX.javaContext);
     CTX.headTracker = CardboardHeadTracker_create();
