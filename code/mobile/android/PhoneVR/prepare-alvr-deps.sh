@@ -51,3 +51,7 @@ unzip download.zip
 rm download.zip
 fi
 
+rm -rf "arcore-android-sdk-main"
+curl -sLS https://github.com/google-ar/arcore-android-sdk/archive/refs/heads/main.zip > download.zip
+unzip download.zip
+rm download.zip
