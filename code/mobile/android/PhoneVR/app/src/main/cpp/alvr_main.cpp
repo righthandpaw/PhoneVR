@@ -45,6 +45,7 @@ struct NativeContext {
     GLuint arTexture = 0;
 
     AlvrQuat lastOrientation = {0.f, 0.f, 0.f, 0.f};
+    AlvrQuat latestARCoreOrientation = {};
     float lastPosition[3] = {0.f, 0.f, 0.f};
 
     // The ARCore pose must be acquired on the OpenGL/render thread.
@@ -120,6 +121,30 @@ void offsetPosWithQuat(AlvrQuat q, float offset[3], float outPos[3]) {
     outPos[1] -= rotatedOffset[1] - FLOOR_HEIGHT;
     outPos[2] -= rotatedOffset[2];
 }
+
+//AI Maths
+
+static AlvrQuat quatMultiply(const AlvrQuat& a, const AlvrQuat& b) {
+    return {
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    };
+}
+
+static AlvrQuat quatInverse(const AlvrQuat& q) {
+    // Assumes q is normalized.
+    return {-q.x, -q.y, -q.z, q.w};
+}
+
+static float quatAngleDegrees(const AlvrQuat& q) {
+    // q and -q represent the same rotation, so use abs(w).
+    float w = std::clamp(std::abs(q.w), 0.0f, 1.0f);
+    return 2.0f * std::acos(w) * 180.0f / M_PI;
+}
+
+//
 
 AlvrFov getFov(CardboardEye eye) {
     float f[4];
@@ -283,10 +308,28 @@ AlvrPose getPose(uint64_t timestampNs) {
         }
 
         if (useARCoreOrientation) {
+            
             auto orientation = AlvrQuat{arRawPose[0], arRawPose[1], arRawPose[2],
-                                               arRawPose[3]};
+                                                arRawPose[3]};
             pose.orientation = orientation;
             CTX.lastOrientation = pose.orientation;
+            
+            auto arcoreOrientation = AlvrQuat{
+                arRawPose[0],
+                arRawPose[1],
+                arRawPose[2],
+                arRawPose[3]
+            };
+
+            // DEBUG ONLY.
+            // Store the raw ARCore orientation for comparison.
+            // This does NOT affect the pose returned by getPose().
+            CTX.latestARCoreOrientation = arcoreOrientation;
+
+            if (useARCoreOrientation) {
+                pose.orientation = arcoreOrientation;
+                CTX.lastOrientation = pose.orientation;
+            }
         }
 
         ArPose_destroy(arPose);
@@ -786,6 +829,71 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                     std::lock_guard<std::mutex> lock(CTX.poseMutex);
                     CTX.latestPose = pose;
                     CTX.latestPoseValid = true;
+                }
+            }
+
+            // DEBUG ONLY: compare Cardboard and ARCore orientations.
+            // This does not modify the pose used for tracking.
+            if (CTX.arcoreEnabled && CTX.arSession != nullptr) {
+                static uint64_t lastOrientationLogNs = 0;
+
+                uint64_t nowNs = GetBootTimeNano();
+
+                // Log approximately once per second.
+                if (nowNs - lastOrientationLogNs >= 1000000000ULL) {
+                    lastOrientationLogNs = nowNs;
+
+                    // Get Cardboard's current orientation independently.
+                    float cardboardPos[3] = {};
+                    float cardboardQ[4] = {};
+
+                    CardboardHeadTracker_getPose(
+                        CTX.headTracker,
+                        (int64_t)poseTimestampNs,
+                        kLandscapeLeft,
+                        cardboardPos,
+                        cardboardQ);
+
+                    AlvrQuat cardboardOrientation = {
+                        cardboardQ[0],
+                        cardboardQ[1],
+                        cardboardQ[2],
+                        cardboardQ[3]
+                    };
+
+                    // 'pose' is the ARCore pose returned by getPose().
+                    //AlvrQuat arcoreOrientation = pose.orientation;
+                    AlvrQuat arcoreOrientation = CTX.latestARCoreOrientation;
+
+                    // Difference that would rotate Cardboard orientation into ARCore
+                    // orientation.
+                    AlvrQuat relativeOrientation =
+                        quatMultiply(arcoreOrientation,
+                                    quatInverse(cardboardOrientation));
+
+                    float relativeAngle =
+                        quatAngleDegrees(relativeOrientation);
+
+                    info(
+                        "ORIENTATION DEBUG:\n"
+                        "  Cardboard: [%.5f, %.5f, %.5f, %.5f]\n"
+                        "  ARCore:    [%.5f, %.5f, %.5f, %.5f]\n"
+                        "  Relative:  [%.5f, %.5f, %.5f, %.5f]\n"
+                        "  Difference angle: %.2f deg",
+                        cardboardOrientation.x,
+                        cardboardOrientation.y,
+                        cardboardOrientation.z,
+                        cardboardOrientation.w,
+                        arcoreOrientation.x,
+                        arcoreOrientation.y,
+                        arcoreOrientation.z,
+                        arcoreOrientation.w,
+                        relativeOrientation.x,
+                        relativeOrientation.y,
+                        relativeOrientation.z,
+                        relativeOrientation.w,
+                        relativeAngle
+                    );
                 }
             }
 
