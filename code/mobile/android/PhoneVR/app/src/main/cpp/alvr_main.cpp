@@ -212,7 +212,7 @@ void sendViewParams() {
 
 void inputThread() {
     auto deadline = std::chrono::steady_clock::now();
-ff
+
     info("inputThread: thread staring...");
     while (CTX.streaming) {
         auto targetTimestampNs = GetBootTimeNano() + ESTIMATED_PREDICTION_OFFSET_NS;
@@ -220,13 +220,13 @@ ff
         CTX.deviceMotion.device_id = HEAD_ID;
         CTX.deviceMotion.pose = getPose(targetTimestampNs);
 
-        alvr_send_tracking(targetTimestampNs, &CTX.deviceMotion, 1, nullptr, nullptr);.
+        alvr_send_tracking(targetTimestampNs, &CTX.deviceMotion, 1, nullptr, nullptr);
 
         deadline += std::chrono::nanoseconds((uint64_t) (1e9 / 60.f / 3));
         std::this_thread::sleep_until(deadline);
     }
 }
-..
+
 extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *) {
     CTX.javaVm = vm;
     return JNI_VERSION_1_6;
