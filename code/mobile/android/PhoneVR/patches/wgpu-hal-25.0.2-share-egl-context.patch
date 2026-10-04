@@ -1,0 +1,99 @@
+diff -ruN -x '*.bak' -x target a/.cargo-ok b/.cargo-ok
+--- a/.cargo-ok	1970-01-01 09:00:00.000000000 +0900
++++ b/.cargo-ok	2026-10-05 01:32:32.592471619 +0900
+@@ -0,0 +1 @@
++{"v":1}
+\ No newline at end of file
+diff -ruN -x '*.bak' -x target a/src/gles/egl.rs b/src/gles/egl.rs
+--- a/src/gles/egl.rs	2026-10-05 01:32:32.518542445 +0900
++++ b/src/gles/egl.rs	2026-10-05 01:32:32.561883826 +0900
+@@ -410,9 +410,13 @@
+ impl<'a> Drop for AdapterContextLock<'a> {
+     fn drop(&mut self) {
+         if let Some(egl) = self.egl.take() {
++            log::info!("ALVR GLES UNLOCK: releasing wgpu EGL context");
++
+             egl.instance
+                 .make_current(egl.display, None, None, None)
+                 .unwrap();
++
++            log::info!("ALVR GLES UNLOCK: wgpu EGL context released");
+         }
+     }
+ }
+@@ -449,7 +453,9 @@
+             .expect("Could not lock adapter context. This is most-likely a deadlock.");
+ 
+         let egl = self.egl.as_ref().map(|egl| {
++            log::info!("ALVR GLES LOCK: making wgpu EGL context current");
+             egl.make_current();
++            log::info!("ALVR GLES LOCK: wgpu EGL context is current");
+             EglContextLock {
+                 instance: &egl.instance,
+                 display: egl.display,
+@@ -654,11 +660,16 @@
+         gl_context_attributes.extend(&context_attributes);
+         gles_context_attributes.extend(&context_attributes);
+ 
+-        let context = if supports_opengl {
+-            egl.create_context(display, config, None, &gl_context_attributes)
++        // ALVR: share GL objects with the app's current EGL context, so textures created by the
++        // app (glGenTextures) are visible inside this context.
++        let share_context = egl.get_current_context();
++        log::info!("ALVR GLES: share context = {:?}", share_context.map(|c| c.as_ptr()));
++
++        let context = if supports_opengl {  
++            egl.create_context(display, config, share_context, &gl_context_attributes)
+                 .or_else(|_| {
+                     egl.bind_api(khronos_egl::OPENGL_ES_API).unwrap();
+-                    egl.create_context(display, config, None, &gles_context_attributes)
++                    egl.create_context(display, config, share_context, &gles_context_attributes)
+                 })
+                 .map_err(|e| {
+                     crate::InstanceError::with_source(
+@@ -667,7 +678,7 @@
+                     )
+                 })
+         } else {
+-            egl.create_context(display, config, None, &gles_context_attributes)
++            egl.create_context(display, config, share_context, &gles_context_attributes)
+                 .map_err(|e| {
+                     crate::InstanceError::with_source(
+                         String::from("unable to create GLES 3.x context"),
+diff -ruN -x '*.bak' -x target a/src/gles/queue.rs b/src/gles/queue.rs
+--- a/src/gles/queue.rs	2026-10-05 01:32:32.518643908 +0900
++++ b/src/gles/queue.rs	2026-10-05 01:32:32.568580204 +0900
+@@ -144,7 +144,14 @@
+                             get_2d_target(target, view.array_layers.start),
+                             Some(raw),
+                             view.mip_levels.start as i32,
+-                        )
++                        );
++                        log::info!(
++                            "ALVR GLES ATTACH: texture={} attachment=0x{:X} error=0x{:X} framebuffer=0x{:X}",
++                            raw.0,
++                            attachment,
++                            gl.get_error(),
++                            gl.check_framebuffer_status(glow::DRAW_FRAMEBUFFER),
++                        );
+                     };
+                 }
+             }
+@@ -1818,8 +1825,17 @@
+         _surface_textures: &[&super::Texture],
+         (signal_fence, signal_value): (&mut super::Fence, crate::FenceValue),
+     ) -> Result<(), crate::DeviceError> {
++        log::info!(
++            "ALVR GLES SUBMIT: entered submit(), command_buffers={}",
++            command_buffers.len()
++        );
++
+         let shared = Arc::clone(&self.shared);
++
++        log::info!("ALVR GLES SUBMIT: about to lock EGL context");
+         let gl = &shared.context.lock();
++        log::info!("ALVR GLES SUBMIT: EGL context locked");
++        
+         for cmd_buf in command_buffers.iter() {
+             // The command encoder assumes a default state when encoding the command buffer.
+             // Always reset the state between command_buffers to reflect this assumption. Do
