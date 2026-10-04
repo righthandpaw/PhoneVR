@@ -1,6 +1,7 @@
 <resources>
     <string name="app_name_full">PhoneVR</string>
     <string name="app_name_lite">PhoneVR noGvr</string>
+    <string name="app_name">PhoneVR</string>
     <string name="app_crash_toast">Oh no :( PVR has unfortunately crashed. Dev team will be notified. You can create an issue on Github or Discord.</string>
     <string name="pc_ip">PC IP</string>
     <string name="auto">Auto</string>
