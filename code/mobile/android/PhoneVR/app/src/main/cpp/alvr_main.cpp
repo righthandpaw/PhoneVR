@@ -233,8 +233,9 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *) {
 }
 
 extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_initializeNative(
-    JNIEnv *env, jobject obj, jint screenWidth, jint screenHeight, jfloat refreshRate) {
+    JNIEnv *env, jobject obj, jint screenWidth, jint screenHeight, jfloat refreshRate,jboolean enableARCore) {
     CTX.javaContext = env->NewGlobalRef(obj);
+    info("initializeNative: enableARCore=%d (not used yet)", (int) enableARCore);
 
     uint32_t viewWidth = (std::max(screenWidth, screenHeight) / 2) & ~15u;  // multiple of 16
     uint32_t viewHeight = std::min(screenWidth, screenHeight) & ~7u;        // multiple of 8
