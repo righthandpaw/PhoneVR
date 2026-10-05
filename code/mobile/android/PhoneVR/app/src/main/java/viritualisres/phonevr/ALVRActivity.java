@@ -105,7 +105,7 @@ public class ALVRActivity extends AppCompatActivity
         float refreshRate = display.getRefreshRate();
         Log.i(TAG, "Refresh rate: " + refreshRate);
 
-        initializeNative(width, height, refreshRate);
+        initializeNative(width, height, refreshRate, true);
 
         setContentView(R.layout.activity_vr);
         glView = findViewById(R.id.surface_view);
@@ -285,7 +285,7 @@ public class ALVRActivity extends AppCompatActivity
     }
 
     private native void initializeNative(
-            int screenWidth, int screenHeight, float screenRefreshRate);
+            int screenWidth, int screenHeight, float screenRefreshRate, boolean enableARCore);
 
     private native void destroyNative();
 

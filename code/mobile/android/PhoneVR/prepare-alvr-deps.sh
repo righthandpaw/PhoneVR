@@ -39,3 +39,7 @@ mv "${CARB_REPO_NAME}/sdk/build/outputs/aar/sdk-release.aar" cardboard/cardboard
 cp "${CARB_REPO_NAME}/sdk/include/cardboard.h" cardboard/cardboard.h
 rm -r "${CARB_REPO_NAME}"
 
+rm -rf "arcore-android-sdk-main"
+curl -sLS https://github.com/google-ar/arcore-android-sdk/archive/refs/heads/main.zip > download.zip
+unzip download.zip
+rm download.zip
