@@ -1,4 +1,5 @@
 #include "alvr_client_core.h"
+#include "arcore_c_api.h"
 #include "cardboard.h"
 #include <GLES3/gl3.h>
 #include <EGL/egl.h>
@@ -8,6 +9,7 @@
 #include <deque>
 #include <jni.h>
 #include <map>
+#include <mutex>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -92,6 +94,15 @@ struct NativeContext {
     CardboardHeadTracker *headTracker = nullptr;
     CardboardLensDistortion *lensDistortion = nullptr;
     CardboardDistortionRenderer *distortionRenderer = nullptr;
+
+    // ARCore (positional tracking). ARCore calls that touch the session must not run
+    // concurrently, so every use of arSession is guarded by arMutex. ArSession_update() must
+    // additionally run on the render thread, with the app's EGL context current.
+    bool arcoreEnabled = false;
+    ArSession *arSession = nullptr;
+    ArFrame *arFrame = nullptr;
+    GLuint arTexture = 0;
+    std::mutex arMutex;
 
     int screenWidth = 0;
     int screenHeight = 0;
@@ -192,6 +203,63 @@ AlvrPose getPose(uint64_t timestampNs) {
     return pose;
 }
 
+// STEP 2a (diagnostic only): update ARCore once per render frame and log what it reports about
+// once per second. The result is NOT used for tracking yet; this only checks that the session
+// runs on the render thread with the app's EGL context current. Must be called from the render
+// thread.
+static void pollARCoreDiagnostics() {
+    if (!CTX.arcoreEnabled || CTX.arTexture == 0) {
+        return;
+    }
+    if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
+        info("ARCore ERROR: pollARCoreDiagnostics called without an EGL context");
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(CTX.arMutex);
+    if (CTX.arSession == nullptr || CTX.arFrame == nullptr) {
+        return;
+    }
+
+    static uint64_t lastLogNs = 0;
+    uint64_t nowNs = GetBootTimeNano();
+    bool shouldLog = nowNs - lastLogNs >= 1000000000ULL;
+
+    ArStatus status = ArSession_update(CTX.arSession, CTX.arFrame);
+    if (status != AR_SUCCESS) {
+        if (shouldLog) {
+            lastLogNs = nowNs;
+            info("ARCore ERROR: ArSession_update failed (status %d)", (int) status);
+        }
+        return;
+    }
+
+    ArCamera *arCamera = nullptr;
+    ArFrame_acquireCamera(CTX.arSession, CTX.arFrame, &arCamera);
+
+    ArTrackingState trackingState;
+    ArCamera_getTrackingState(CTX.arSession, arCamera, &trackingState);
+
+    if (shouldLog) {
+        lastLogNs = nowNs;
+        if (trackingState == AR_TRACKING_STATE_TRACKING) {
+            ArPose *arPose = nullptr;
+            ArPose_create(CTX.arSession, nullptr, &arPose);
+            ArCamera_getDisplayOrientedPose(CTX.arSession, arCamera, arPose);
+            // {qx, qy, qz, qw, tx, ty, tz}
+            float raw[7] = {};
+            ArPose_getPoseRaw(CTX.arSession, arPose, raw);
+            ArPose_destroy(arPose);
+            info("ARCore: tracking, position=(%.3f, %.3f, %.3f) quat=(%.3f, %.3f, %.3f, %.3f)",
+                 raw[4], raw[5], raw[6], raw[0], raw[1], raw[2], raw[3]);
+        } else {
+            info("ARCore: not tracking (state %d)", (int) trackingState);
+        }
+    }
+
+    ArCamera_release(arCamera);
+}
+
 // Local-space (head-at-origin) per-eye view parameters: just the eye offset and FOV. These rarely
 // change (only when the lens distortion / viewer profile is recalculated), so this is sent once
 // via alvr_send_view_params() rather than on every tracking update - unlike the v20 API, the
@@ -235,7 +303,7 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *) {
 extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_initializeNative(
     JNIEnv *env, jobject obj, jint screenWidth, jint screenHeight, jfloat refreshRate,jboolean enableARCore) {
     CTX.javaContext = env->NewGlobalRef(obj);
-    info("initializeNative: enableARCore=%d (not used yet)", (int) enableARCore);
+    info("initializeNative: enableARCore=%d", (int) enableARCore);
 
     uint32_t viewWidth = (std::max(screenWidth, screenHeight) / 2) & ~15u;  // multiple of 16
     uint32_t viewHeight = std::min(screenWidth, screenHeight) & ~7u;        // multiple of 8
@@ -267,6 +335,46 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_initia
 
     Cardboard_initializeAndroid(CTX.javaVm, CTX.javaContext);
     CTX.headTracker = CardboardHeadTracker_create();
+
+    CTX.arcoreEnabled = (bool) enableARCore;
+    if (CTX.arcoreEnabled) {
+        if (ArSession_create(env, CTX.javaContext, &CTX.arSession) != AR_SUCCESS) {
+            info("ARCore ERROR: could not create session (is Google Play Services for AR "
+                 "installed?); continuing without ARCore");
+            CTX.arSession = nullptr;
+            CTX.arcoreEnabled = false;
+        }
+    }
+
+    if (CTX.arcoreEnabled) {
+        ArConfig *arConfig = nullptr;
+        ArConfig_create(CTX.arSession, &arConfig);
+
+        // Explicitly disable everything we don't need, to preserve CPU and battery.
+        ArConfig_setDepthMode(CTX.arSession, arConfig, AR_DEPTH_MODE_DISABLED);
+        ArConfig_setLightEstimationMode(
+            CTX.arSession, arConfig, AR_LIGHT_ESTIMATION_MODE_DISABLED);
+        ArConfig_setPlaneFindingMode(
+            CTX.arSession, arConfig, AR_PLANE_FINDING_MODE_HORIZONTAL_AND_VERTICAL);
+        ArConfig_setCloudAnchorMode(CTX.arSession, arConfig, AR_CLOUD_ANCHOR_MODE_DISABLED);
+        // Don't block waiting for a new camera image.
+        ArConfig_setUpdateMode(CTX.arSession, arConfig, AR_UPDATE_MODE_LATEST_CAMERA_IMAGE);
+
+        ArStatus configureStatus = ArSession_configure(CTX.arSession, arConfig);
+        ArConfig_destroy(arConfig);
+
+        if (configureStatus != AR_SUCCESS) {
+            info("ARCore ERROR: could not configure session (status %d); continuing without "
+                 "ARCore",
+                 (int) configureStatus);
+            ArSession_destroy(CTX.arSession);
+            CTX.arSession = nullptr;
+            CTX.arcoreEnabled = false;
+        } else {
+            ArFrame_create(CTX.arSession, &CTX.arFrame);
+            info("ARCore session created and configured");
+        }
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_destroyNative(JNIEnv *,
@@ -280,11 +388,34 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_destro
     CTX.lensDistortion = nullptr;
     CardboardDistortionRenderer_destroy(CTX.distortionRenderer);
     CTX.distortionRenderer = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(CTX.arMutex);
+        if (CTX.arFrame != nullptr) {
+            ArFrame_destroy(CTX.arFrame);
+            CTX.arFrame = nullptr;
+        }
+        if (CTX.arSession != nullptr) {
+            ArSession_destroy(CTX.arSession);
+            CTX.arSession = nullptr;
+        }
+        CTX.arcoreEnabled = false;
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_resumeNative(JNIEnv *,
                                                                                        jobject) {
     CardboardHeadTracker_resume(CTX.headTracker);
+
+    {
+        std::lock_guard<std::mutex> lock(CTX.arMutex);
+        if (CTX.arcoreEnabled && CTX.arSession != nullptr) {
+            ArStatus arStatus = ArSession_resume(CTX.arSession);
+            if (arStatus != AR_SUCCESS) {
+                info("ARCore ERROR: failed to resume session (status %d)", (int) arStatus);
+            }
+        }
+    }
 
     CTX.renderingParamsChanged = true;
 
@@ -313,6 +444,14 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_pauseN
     }
 
     CardboardHeadTracker_pause(CTX.headTracker);
+
+    // Releases the camera. (The v20 code never paused the ARCore session.)
+    {
+        std::lock_guard<std::mutex> lock(CTX.arMutex);
+        if (CTX.arcoreEnabled && CTX.arSession != nullptr) {
+            ArSession_pause(CTX.arSession);
+        }
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -458,6 +597,29 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             alvr_resume_opengl(CTX.screenWidth / 2, CTX.screenHeight, targetViews, 1);
         }
         EGLCHK("after alvr_resume_opengl (restored)");
+
+        // ARCore needs a GL texture to write camera frames into. We never draw the camera
+        // image, but ARCore requires one. If the GL context was recreated the old texture is
+        // already gone; otherwise delete it so it doesn't leak.
+        if (CTX.arcoreEnabled && CTX.arSession != nullptr) {
+            if (CTX.arTexture != 0 && !CTX.glContextRecreated) {
+                glDeleteTextures(1, &CTX.arTexture);
+            }
+            GLuint arTextureIds[1] = {0};
+            glGenTextures(1, arTextureIds);
+            GL(glBindTexture(GL_TEXTURE_2D, arTextureIds[0]));
+            GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+            GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+            GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
+            GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+
+            {
+                std::lock_guard<std::mutex> lock(CTX.arMutex);
+                CTX.arTexture = arTextureIds[0];
+                ArSession_setCameraTextureName(CTX.arSession, CTX.arTexture);
+            }
+            info("ARCore camera texture initialized: %u", (unsigned) CTX.arTexture);
+        }
 
         CTX.renderingParamsChanged = false;
         CTX.glContextRecreated = false;
@@ -632,6 +794,9 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
     // 4) right after the closing brace of the `while (alvr_poll_event(&event))` loop,
     //    before `CardboardEyeTextureDescription viewsDescs[2] = {};`
     EGLCHK("after event loop");
+
+    // Step 2a: diagnostics only; the ARCore result is not used for tracking yet.
+    pollARCoreDiagnostics();
 
     CardboardEyeTextureDescription viewsDescs[2] = {};
     for (auto &viewsDesc : viewsDescs) {
