@@ -103,6 +103,24 @@ constexpr uint64_t ARCORE_MAX_CORRECTION_GAP_NS = 500000000ULL;
 // (landscape-left). Found by calibration on one phone; other phones may need other values.
 const AlvrQuat ARCORE_TO_CARDBOARD = {-0.0057f, -0.0031f, 0.7076f, 0.7066f};
 
+// ---- ARCore head height ----
+// How the vertical position is derived:
+//   0 = relative to where ARCore started (height starts at 0, as in the earlier builds).
+//   1 = height above the detected floor (the v20 behaviour). Until a floor is found it is the
+//       same as 0, so the height jumps the moment the floor is first detected.
+//   2 = like 1, but until a floor is found it assumes the headset started
+//       ARCORE_ASSUMED_START_HEIGHT_M above the floor, and it eases toward the measured floor
+//       height instead of jumping.
+constexpr int ARCORE_HEIGHT_MODE = 2;
+// Mode 2 only: assumed height above the floor at the start, before any floor has been detected.
+constexpr float ARCORE_ASSUMED_START_HEIGHT_M = 1.5f;
+// Mode 2 only: how slowly the height eases toward the measured floor. Larger = slower.
+constexpr float ARCORE_FLOOR_BLEND_TIME_CONSTANT_S = 2.0f;
+// Added to the height in every mode. Use it to tune the height by hand (negative = lower).
+constexpr float ARCORE_HEIGHT_OFFSET_M = 0.0f;
+// A newly detected plane has to be this much lower than the current floor to replace it.
+constexpr float ARCORE_FLOOR_REANCHOR_MARGIN_M = 0.03f;
+
 struct NativeContext {
     JavaVM *javaVm = nullptr;
     jobject javaContext = nullptr;
@@ -117,6 +135,12 @@ struct NativeContext {
     bool arcoreEnabled = false;
     ArSession *arSession = nullptr;
     ArFrame *arFrame = nullptr;
+    // Anchor on the lowest horizontal plane found so far (taken to be the floor). An anchor keeps
+    // following the floor when ARCore adjusts its world frame. Render thread only (arMutex).
+    ArAnchor *arFloorAnchor = nullptr;
+    // Mode 2: how far above the floor ARCore's origin is, eased toward the measured value.
+    float floorOffsetM = ARCORE_ASSUMED_START_HEIGHT_M;
+    uint64_t lastFloorBlendNs = 0;
     GLuint arTexture = 0;
     std::mutex arMutex;
 
@@ -306,6 +330,101 @@ AlvrPose getPose(uint64_t timestampNs) {
     return pose;
 }
 
+// Height (y) of an anchor in ARCore's world frame.
+static float anchorHeight(const ArAnchor *anchor) {
+    ArPose *pose = nullptr;
+    ArPose_create(CTX.arSession, nullptr, &pose);
+    ArAnchor_getPose(CTX.arSession, anchor, pose);
+    float raw[7] = {};
+    ArPose_getPoseRaw(CTX.arSession, pose, raw);
+    ArPose_destroy(pose);
+    return raw[5];
+}
+
+// Looks for the floor: the lowest horizontal, upward-facing plane ARCore has found so far. When
+// one is known, returns true and sets *outFloorY to the floor's height in ARCore's world frame
+// (read from an anchor, so it follows any adjustment ARCore makes to that frame).
+// Render thread only, with arMutex held and a successful ArSession_update behind it.
+static bool updateFloorAnchor(float *outFloorY) {
+    ArTrackableList *planes = nullptr;
+    ArTrackableList_create(CTX.arSession, &planes);
+    ArFrame_getUpdatedTrackables(CTX.arSession, CTX.arFrame, AR_TRACKABLE_PLANE, planes);
+    int32_t planeCount = 0;
+    ArTrackableList_getSize(CTX.arSession, planes, &planeCount);
+
+    // Is the current floor anchor still usable?
+    float floorY = 0.0f;
+    bool haveFloor = false;
+    if (CTX.arFloorAnchor != nullptr) {
+        ArTrackingState anchorState;
+        ArAnchor_getTrackingState(CTX.arSession, CTX.arFloorAnchor, &anchorState);
+        if (anchorState == AR_TRACKING_STATE_STOPPED) {
+            // ARCore has given up on this anchor, so forget it.
+            ArAnchor_release(CTX.arFloorAnchor);
+            CTX.arFloorAnchor = nullptr;
+        } else if (anchorState == AR_TRACKING_STATE_TRACKING) {
+            floorY = anchorHeight(CTX.arFloorAnchor);
+            haveFloor = true;
+        }
+    }
+
+    for (int32_t i = 0; i < planeCount; i++) {
+        ArTrackable *trackable = nullptr;
+        ArTrackableList_acquireItem(CTX.arSession, planes, i, &trackable);
+        if (trackable == nullptr) {
+            continue;
+        }
+
+        ArTrackingState planeState;
+        ArTrackable_getTrackingState(CTX.arSession, trackable, &planeState);
+        ArPlaneType planeType;
+        ArPlane_getType(CTX.arSession, ArAsPlane(trackable), &planeType);
+
+        if (planeState == AR_TRACKING_STATE_TRACKING &&
+            planeType == AR_PLANE_HORIZONTAL_UPWARD_FACING) {
+            ArPose *planePose = nullptr;
+            ArPose_create(CTX.arSession, nullptr, &planePose);
+            ArPlane_getCenterPose(CTX.arSession, ArAsPlane(trackable), planePose);
+            float planeRaw[7] = {};
+            ArPose_getPoseRaw(CTX.arSession, planePose, planeRaw);
+            float planeY = planeRaw[5];
+
+            // The floor is the lowest such plane (tables and shelves are higher).
+            if (!haveFloor || planeY < floorY - ARCORE_FLOOR_REANCHOR_MARGIN_M) {
+                // Anchor at the plane's position only, without its rotation. (Poses are created
+                // from {qx, qy, qz, qw, tx, ty, tz}.)
+                const float translationOnlyRaw[7] = {
+                    0.f, 0.f, 0.f, 1.f, planeRaw[4], planeRaw[5], planeRaw[6]};
+                ArPose *translationOnly = nullptr;
+                ArPose_create(CTX.arSession, translationOnlyRaw, &translationOnly);
+                ArAnchor *newAnchor = nullptr;
+                if (ArTrackable_acquireNewAnchor(
+                        CTX.arSession, trackable, translationOnly, &newAnchor) == AR_SUCCESS) {
+                    if (CTX.arFloorAnchor != nullptr) {
+                        ArAnchor_detach(CTX.arSession, CTX.arFloorAnchor);
+                        ArAnchor_release(CTX.arFloorAnchor);
+                    }
+                    CTX.arFloorAnchor = newAnchor;
+                    info("ARCore: floor %s at y=%.3f",
+                         haveFloor ? "lowered" : "found",
+                         planeY);
+                    floorY = planeY;
+                    haveFloor = true;
+                }
+                ArPose_destroy(translationOnly);
+            }
+            ArPose_destroy(planePose);
+        }
+        ArTrackable_release(trackable);
+    }
+    ArTrackableList_destroy(planes);
+
+    if (haveFloor) {
+        *outFloorY = floorY;
+    }
+    return haveFloor;
+}
+
 // Updates ARCore once per render frame and publishes what getPose() needs: the ARCore position
 // and the orientation correction. Must be called from the render thread, with the app's EGL
 // context current (ArSession_update requires it).
@@ -361,6 +480,34 @@ static void updateARCoreTracking() {
     ArPose_destroy(arPose);
     ArCamera_release(arCamera);
 
+    // Vertical position (see ARCORE_HEIGHT_MODE).
+    float headY = raw[5];
+    float floorY = 0.0f;
+    bool floorKnown = false;
+    if (ARCORE_HEIGHT_MODE != 0) {
+        floorKnown = updateFloorAnchor(&floorY);
+    }
+    if (ARCORE_HEIGHT_MODE == 1) {
+        if (floorKnown) {
+            headY = raw[5] - floorY;
+        }
+    } else if (ARCORE_HEIGHT_MODE == 2) {
+        if (floorKnown) {
+            uint64_t blendDtNs = CTX.lastFloorBlendNs != 0 ? nowNs - CTX.lastFloorBlendNs : 0;
+            if (blendDtNs > 0 && blendDtNs < ARCORE_MAX_CORRECTION_GAP_NS) {
+                float gain = 1.0f - std::exp(-((float) blendDtNs * 1e-9f) /
+                                              ARCORE_FLOOR_BLEND_TIME_CONSTANT_S);
+                // ARCore's origin is -floorY above the floor.
+                CTX.floorOffsetM += (-floorY - CTX.floorOffsetM) * gain;
+            }
+            CTX.lastFloorBlendNs = nowNs;
+        } else {
+            CTX.lastFloorBlendNs = 0;
+        }
+        headY = raw[5] + CTX.floorOffsetM;
+    }
+    headY += ARCORE_HEIGHT_OFFSET_M;
+
     // How far apart are Cardboard and ARCore right now?
     AlvrQuat cardboardOrientation =
         cardboardOrientationAt(nowNs + ESTIMATED_PREDICTION_OFFSET_NS);
@@ -379,7 +526,7 @@ static void updateARCoreTracking() {
         std::lock_guard<std::mutex> poseLock(CTX.poseMutex);
 
         CTX.arPosition[0] = raw[4];
-        CTX.arPosition[1] = raw[5];
+        CTX.arPosition[1] = headY;
         CTX.arPosition[2] = raw[6];
         CTX.arPositionValid = true;
 
@@ -407,9 +554,10 @@ static void updateARCoreTracking() {
 
     if (shouldLog) {
         lastLogNs = nowNs;
-        info("ARCore: tracking, position=(%.3f, %.3f, %.3f) | orientation error=%.2f deg, "
-             "correction=%.2f deg, sample %s",
-             raw[4], raw[5], raw[6], errorDeg, correctionDeg, accepted ? "accepted" : "rejected");
+        info("ARCore: tracking, position=(%.3f, %.3f, %.3f), floor %s (y=%.2f) | orientation "
+             "error=%.2f deg, correction=%.2f deg, sample %s",
+             raw[4], headY, raw[6], floorKnown ? "known" : "unknown", floorY, errorDeg,
+             correctionDeg, accepted ? "accepted" : "rejected");
     }
 }
 
@@ -544,6 +692,10 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_destro
 
     {
         std::lock_guard<std::mutex> lock(CTX.arMutex);
+        if (CTX.arFloorAnchor != nullptr) {
+            ArAnchor_release(CTX.arFloorAnchor);
+            CTX.arFloorAnchor = nullptr;
+        }
         if (CTX.arFrame != nullptr) {
             ArFrame_destroy(CTX.arFrame);
             CTX.arFrame = nullptr;
