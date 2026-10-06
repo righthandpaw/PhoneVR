@@ -152,6 +152,13 @@ struct NativeContext {
     bool hasFrameMetadata = false;
     AlvrVideoFrameMetadata lastFrameMetadata = {};
 
+    // The last decoded video frame, kept so it can be shown again (re-oriented to the current
+    // head pose) on display refreshes where no new video frame has arrived. The buffer belongs
+    // to the decoder, so this is cleared whenever the decoder is created or destroyed or a
+    // stream starts or stops.
+    void *lastStreamBuffer = nullptr;
+    uint64_t lastStreamTimestampNs = 0;
+
     NativeContext() {
         memset(&fovArr, 0, sizeof(fovArr));
         memset(&deviceMotion, 0, sizeof(deviceMotion));
@@ -802,6 +809,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             // manual settings-JSON parsing needed here (settings.video.foveated_encoding, as
             // the v20 code did).
             CTX.hasFrameMetadata = false;
+            CTX.lastStreamBuffer = nullptr;
 
             GL(glGenTextures(2, CTX.streamTextures));
 
@@ -917,6 +925,8 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                      "software=%d",
                      (int) decoderConfig.codec, (unsigned long long) configSize,
                      (int) FORCE_SOFTWARE_DECODER);
+                // The saved frame belongs to the previous decoder, if there was one.
+                CTX.lastStreamBuffer = nullptr;
                 alvr_create_decoder(decoderConfig);
                 g_decoderCreated = true;
             }
@@ -927,6 +937,8 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             CTX.streaming = false;
             CTX.inputThread.join();
 
+            // The saved frame belongs to the decoder that is about to be destroyed.
+            CTX.lastStreamBuffer = nullptr;
             if (g_decoderCreated) {
                 alvr_destroy_decoder();
                 g_decoderCreated = false;
@@ -956,22 +968,38 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
         void *streamHardwareBuffer = nullptr;
         uint64_t timestampNs = 0;
 
-        if (!alvr_get_frame(&timestampNs, &streamHardwareBuffer)) {
-            return;
-        }
+        // A new decoded frame is not available on every display refresh: the video usually
+        // arrives more slowly than the display runs. Returning here without drawing leaves the
+        // screen showing stale or blank content, which looks like stuttering. Instead keep
+        // showing the last frame, re-oriented to the current head pose by the reprojection
+        // below.
+        bool isNewFrame = alvr_get_frame(&timestampNs, &streamHardwareBuffer);
 
-        // v21 no longer returns view params from alvr_get_frame() directly; fetch the
-        // server-aligned metadata (view params + foveation centers) matched to this frame here
-        // instead. If there's no match for this exact frame, fall back to the last known-good
-        // metadata, per the API doc for this function.
         AlvrVideoFrameMetadata metadata;
-        if (alvr_report_compositor_start(timestampNs, &metadata)) {
-            CTX.lastFrameMetadata = metadata;
-            CTX.hasFrameMetadata = true;
-        } else if (CTX.hasFrameMetadata) {
+        if (isNewFrame) {
+            CTX.lastStreamBuffer = streamHardwareBuffer;
+            CTX.lastStreamTimestampNs = timestampNs;
+
+            // v21 no longer returns view params from alvr_get_frame() directly; fetch the
+            // server-aligned metadata (view params + foveation centers) matched to this frame
+            // here instead. If there's no match for this exact frame, fall back to the last
+            // known-good metadata, per the API doc for this function.
+            if (alvr_report_compositor_start(timestampNs, &metadata)) {
+                CTX.lastFrameMetadata = metadata;
+                CTX.hasFrameMetadata = true;
+            } else if (CTX.hasFrameMetadata) {
+                metadata = CTX.lastFrameMetadata;
+            } else {
+                // No metadata at all yet (first frame) - nothing sensible to reproject against.
+                return;
+            }
+        } else if (CTX.lastStreamBuffer != nullptr && CTX.hasFrameMetadata) {
+            // No new frame: show the previous one again, with the metadata that belongs to it.
+            streamHardwareBuffer = CTX.lastStreamBuffer;
+            timestampNs = CTX.lastStreamTimestampNs;
             metadata = CTX.lastFrameMetadata;
         } else {
-            // No metadata at all yet (first frame) - nothing sensible to reproject against.
+            // Nothing has been decoded yet.
             return;
         }
 
@@ -998,7 +1026,10 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             alvr_render_stream_opengl(streamHardwareBuffer, streamViewParams, foveationCenters));
         EGLCHK("after alvr_render_stream_opengl()");
 
-        alvr_report_submit(timestampNs, 0);
+        // The statistics are per decoded frame, so only report frames that are new.
+        if (isNewFrame) {
+            alvr_report_submit(timestampNs, 0);
+        }
 
         viewsDescs[0].texture = CTX.streamTextures[0];
         viewsDescs[1].texture = CTX.streamTextures[1];
