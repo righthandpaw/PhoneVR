@@ -5,6 +5,7 @@
 #include <EGL/egl.h>
 #include <algorithm>
 #include <android/log.h>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <jni.h>
@@ -87,6 +88,21 @@ const uint64_t VSYNC_QUEUE_INTERVAL_NS = 50e6;
 const float FLOOR_HEIGHT = 1.5;
 const int MAXIMUM_TRACKING_FRAMES = 360;
 
+// ---- ARCore tuning (values carried over from the v20 branch; tuned on one phone only) ----
+// Use ARCore's position as the head position (otherwise position stays at the origin: 3DoF).
+constexpr bool ARCORE_USE_POSITION = true;
+// Slowly pull Cardboard's drifting orientation toward ARCore's (complementary filter).
+constexpr bool ARCORE_USE_ORIENTATION_CORRECTION = true;
+// How fast the correction follows ARCore. Larger = slower and smoother.
+constexpr float ARCORE_CORRECTION_TIME_CONSTANT_S = 3.0f;
+// If Cardboard and ARCore disagree by more than this, ignore the sample as a bad measurement.
+constexpr float ARCORE_MAX_ORIENTATION_ERROR_DEG = 15.0f;
+// Ignore the update after a gap longer than this (pause, lifecycle change, debugger).
+constexpr uint64_t ARCORE_MAX_CORRECTION_GAP_NS = 500000000ULL;
+// Fixed rotation between ARCore's display-oriented camera frame and Cardboard's frame
+// (landscape-left). Found by calibration on one phone; other phones may need other values.
+const AlvrQuat ARCORE_TO_CARDBOARD = {-0.0057f, -0.0031f, 0.7076f, 0.7066f};
+
 struct NativeContext {
     JavaVM *javaVm = nullptr;
     jobject javaContext = nullptr;
@@ -103,6 +119,14 @@ struct NativeContext {
     ArFrame *arFrame = nullptr;
     GLuint arTexture = 0;
     std::mutex arMutex;
+
+    // Pose state written by the render thread (updateARCoreTracking) and read by any thread
+    // that calls getPose(), for example the input thread. Guarded by poseMutex.
+    std::mutex poseMutex;
+    bool arPositionValid = false;
+    float arPosition[3] = {0.f, 0.f, 0.f};
+    AlvrQuat orientationCorrection = {0.f, 0.f, 0.f, 1.f};
+    uint64_t lastCorrectionNs = 0;
 
     int screenWidth = 0;
     int screenHeight = 0;
@@ -183,36 +207,107 @@ AlvrFov getFov(CardboardEye eye) {
     return fov;
 }
 
-// Head pose, in world/tracking space (not head-relative). Rotation currently comes straight from
-// the Cardboard SDK's gyro-only sensor fusion, so it has no absolute position and will drift over
-// time - this is the exact function that the planned ARCore + complementary filter work (a
-// separate, later step) will extend to fuse in ARCore's 6DoF pose.
-AlvrPose getPose(uint64_t timestampNs) {
-    AlvrPose pose = {};
+// Quaternion helpers for the orientation correction (same maths as the v20 branch).
+static AlvrQuat quatMultiply(const AlvrQuat &a, const AlvrQuat &b) {
+    return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
 
+// Inverse of a unit quaternion.
+static AlvrQuat quatInverse(const AlvrQuat &q) { return {-q.x, -q.y, -q.z, q.w}; }
+
+static AlvrQuat normalizeQuat(AlvrQuat q) {
+    float len = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    if (len < 1e-6f) {
+        return {0.f, 0.f, 0.f, 1.f};
+    }
+    return {q.x / len, q.y / len, q.z / len, q.w / len};
+}
+
+// q and -q are the same rotation, so use abs(w).
+static float quatAngleDegrees(const AlvrQuat &q) {
+    float w = std::clamp(std::abs(q.w), 0.0f, 1.0f);
+    return 2.0f * std::acos(w) * 180.0f / (float) M_PI;
+}
+
+static AlvrQuat slerpQuat(AlvrQuat a, AlvrQuat b, float t) {
+    a = normalizeQuat(a);
+    b = normalizeQuat(b);
+
+    float dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+
+    // Take the shortest path.
+    if (dot < 0.0f) {
+        b = {-b.x, -b.y, -b.z, -b.w};
+        dot = -dot;
+    }
+
+    // Very close: normalized linear interpolation is enough.
+    if (dot > 0.9995f) {
+        return normalizeQuat({a.x + t * (b.x - a.x),
+                              a.y + t * (b.y - a.y),
+                              a.z + t * (b.z - a.z),
+                              a.w + t * (b.w - a.w)});
+    }
+
+    float theta = std::acos(dot);
+    float sinTheta = std::sin(theta);
+    float wa = std::sin((1.0f - t) * theta) / sinTheta;
+    float wb = std::sin(t * theta) / sinTheta;
+
+    return normalizeQuat({wa * a.x + wb * b.x,
+                          wa * a.y + wb * b.y,
+                          wa * a.z + wb * b.z,
+                          wa * a.w + wb * b.w});
+}
+
+// Cardboard's orientation at the given time, in the same convention the rest of this file uses.
+static AlvrQuat cardboardOrientationAt(uint64_t timestampNs) {
     float pos[3];
     float q[4];
     CardboardHeadTracker_getPose(CTX.headTracker, (int64_t) timestampNs, kLandscapeLeft, pos, q);
+    return normalizeQuat(inverseQuat(AlvrQuat{q[0], q[1], q[2], q[3]}));
+}
 
-    auto inverseOrientation = AlvrQuat{q[0], q[1], q[2], q[3]};
-    pose.orientation = inverseQuat(inverseOrientation);
+// Head pose, in world/tracking space (not head-relative). Safe to call from any thread.
+//
+// Orientation: Cardboard's fast gyro orientation, multiplied by a slowly changing correction that
+// the render thread computes from ARCore (updateARCoreTracking). This is what removes the drift.
+// Position: ARCore's last known position, or the origin until ARCore has tracked (3DoF).
+AlvrPose getPose(uint64_t timestampNs) {
+    AlvrPose pose = {};
 
-    // Cardboard-only tracking has no position signal (3DoF), so position stays at the origin
-    // for now.
+    AlvrQuat orientation = cardboardOrientationAt(timestampNs);
 
+    {
+        std::lock_guard<std::mutex> lock(CTX.poseMutex);
+
+        if (ARCORE_USE_ORIENTATION_CORRECTION) {
+            orientation = normalizeQuat(quatMultiply(orientation, CTX.orientationCorrection));
+        }
+
+        if (ARCORE_USE_POSITION && CTX.arPositionValid) {
+            for (int i = 0; i < 3; i++) {
+                pose.position[i] = CTX.arPosition[i];
+            }
+        }
+    }
+
+    pose.orientation = orientation;
     return pose;
 }
 
-// STEP 2a (diagnostic only): update ARCore once per render frame and log what it reports about
-// once per second. The result is NOT used for tracking yet; this only checks that the session
-// runs on the render thread with the app's EGL context current. Must be called from the render
-// thread.
-static void pollARCoreDiagnostics() {
+// Updates ARCore once per render frame and publishes what getPose() needs: the ARCore position
+// and the orientation correction. Must be called from the render thread, with the app's EGL
+// context current (ArSession_update requires it).
+static void updateARCoreTracking() {
     if (!CTX.arcoreEnabled || CTX.arTexture == 0) {
         return;
     }
     if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
-        info("ARCore ERROR: pollARCoreDiagnostics called without an EGL context");
+        info("ARCore ERROR: updateARCoreTracking called without an EGL context");
         return;
     }
 
@@ -240,24 +335,75 @@ static void pollARCoreDiagnostics() {
     ArTrackingState trackingState;
     ArCamera_getTrackingState(CTX.arSession, arCamera, &trackingState);
 
-    if (shouldLog) {
-        lastLogNs = nowNs;
-        if (trackingState == AR_TRACKING_STATE_TRACKING) {
-            ArPose *arPose = nullptr;
-            ArPose_create(CTX.arSession, nullptr, &arPose);
-            ArCamera_getDisplayOrientedPose(CTX.arSession, arCamera, arPose);
-            // {qx, qy, qz, qw, tx, ty, tz}
-            float raw[7] = {};
-            ArPose_getPoseRaw(CTX.arSession, arPose, raw);
-            ArPose_destroy(arPose);
-            info("ARCore: tracking, position=(%.3f, %.3f, %.3f) quat=(%.3f, %.3f, %.3f, %.3f)",
-                 raw[4], raw[5], raw[6], raw[0], raw[1], raw[2], raw[3]);
-        } else {
+    if (trackingState != AR_TRACKING_STATE_TRACKING) {
+        // Not tracking: keep the last known position and correction.
+        if (shouldLog) {
+            lastLogNs = nowNs;
             info("ARCore: not tracking (state %d)", (int) trackingState);
         }
+        ArCamera_release(arCamera);
+        return;
     }
 
+    ArPose *arPose = nullptr;
+    ArPose_create(CTX.arSession, nullptr, &arPose);
+    ArCamera_getDisplayOrientedPose(CTX.arSession, arCamera, arPose);
+    // {qx, qy, qz, qw, tx, ty, tz}
+    float raw[7] = {};
+    ArPose_getPoseRaw(CTX.arSession, arPose, raw);
+    ArPose_destroy(arPose);
     ArCamera_release(arCamera);
+
+    // How far apart are Cardboard and ARCore right now?
+    AlvrQuat cardboardOrientation =
+        cardboardOrientationAt(nowNs + ESTIMATED_PREDICTION_OFFSET_NS);
+    AlvrQuat arcoreOrientation = normalizeQuat(AlvrQuat{raw[0], raw[1], raw[2], raw[3]});
+    AlvrQuat arcoreInCardboard =
+        normalizeQuat(quatMultiply(arcoreOrientation, quatInverse(ARCORE_TO_CARDBOARD)));
+    // The rotation that would take Cardboard's orientation onto ARCore's.
+    AlvrQuat relative =
+        normalizeQuat(quatMultiply(quatInverse(cardboardOrientation), arcoreInCardboard));
+    float errorDeg = quatAngleDegrees(relative);
+
+    bool accepted = errorDeg < ARCORE_MAX_ORIENTATION_ERROR_DEG;
+    float correctionDeg = 0.0f;
+
+    {
+        std::lock_guard<std::mutex> poseLock(CTX.poseMutex);
+
+        CTX.arPosition[0] = raw[4];
+        CTX.arPosition[1] = raw[5];
+        CTX.arPosition[2] = raw[6];
+        CTX.arPositionValid = true;
+
+        if (accepted) {
+            if (CTX.lastCorrectionNs == 0) {
+                CTX.lastCorrectionNs = nowNs;
+            }
+            uint64_t deltaNs = nowNs - CTX.lastCorrectionNs;
+            // Protect against an unexpectedly large gap (pause, debugger, lifecycle change).
+            if (deltaNs > 0 && deltaNs < ARCORE_MAX_CORRECTION_GAP_NS) {
+                float dt = (float) deltaNs * 1e-9f;
+                // Time-based gain, so the result doesn't depend on the frame rate.
+                float gain = 1.0f - std::exp(-dt / ARCORE_CORRECTION_TIME_CONSTANT_S);
+                CTX.orientationCorrection =
+                    slerpQuat(CTX.orientationCorrection, relative, gain);
+            }
+            CTX.lastCorrectionNs = nowNs;
+        } else {
+            // Don't let a transient mismatch pull the correction toward a bad measurement.
+            CTX.lastCorrectionNs = nowNs;
+        }
+
+        correctionDeg = quatAngleDegrees(CTX.orientationCorrection);
+    }
+
+    if (shouldLog) {
+        lastLogNs = nowNs;
+        info("ARCore: tracking, position=(%.3f, %.3f, %.3f) | orientation error=%.2f deg, "
+             "correction=%.2f deg, sample %s",
+             raw[4], raw[5], raw[6], errorDeg, correctionDeg, accepted ? "accepted" : "rejected");
+    }
 }
 
 // Local-space (head-at-origin) per-eye view parameters: just the eye offset and FOV. These rarely
@@ -795,8 +941,8 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
     //    before `CardboardEyeTextureDescription viewsDescs[2] = {};`
     EGLCHK("after event loop");
 
-    // Step 2a: diagnostics only; the ARCore result is not used for tracking yet.
-    pollARCoreDiagnostics();
+    // Update ARCore on the render thread; getPose() then uses its position and correction.
+    updateARCoreTracking();
 
     CardboardEyeTextureDescription viewsDescs[2] = {};
     for (auto &viewsDesc : viewsDescs) {
