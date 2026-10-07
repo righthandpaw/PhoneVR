@@ -95,8 +95,15 @@ constexpr bool ARCORE_USE_POSITION = true;
 constexpr bool ARCORE_USE_ORIENTATION_CORRECTION = true;
 // How fast the correction follows ARCore. Larger = slower and smoother.
 constexpr float ARCORE_CORRECTION_TIME_CONSTANT_S = 3.0f;
-// If Cardboard and ARCore disagree by more than this, ignore the sample as a bad measurement.
-constexpr float ARCORE_MAX_ORIENTATION_ERROR_DEG = 15.0f;
+// A sample is ignored as a bad measurement when it disagrees with the orientation we are
+// currently showing (Cardboard plus the correction) by more than this. How much drift Cardboard
+// has built up in total does not matter, only the disagreement left after the correction.
+constexpr float ARCORE_MAX_RESIDUAL_DEG = 15.0f;
+// If samples keep disagreeing for this long, ARCore has probably moved its world frame (tracking
+// was lost and regained, or it relocalized), so the new value is accepted...
+constexpr float ARCORE_REACQUIRE_AFTER_S = 1.5f;
+// ...and the correction follows it with this faster time constant until the two agree again.
+constexpr float ARCORE_REACQUIRE_TIME_CONSTANT_S = 1.0f;
 // Ignore the update after a gap longer than this (pause, lifecycle change, debugger).
 constexpr uint64_t ARCORE_MAX_CORRECTION_GAP_NS = 500000000ULL;
 // Fixed rotation between ARCore's display-oriented camera frame and Cardboard's frame
@@ -111,7 +118,7 @@ const AlvrQuat ARCORE_TO_CARDBOARD = {-0.0057f, -0.0031f, 0.7076f, 0.7066f};
 //   2 = like 1, but until a floor is found it assumes the headset started
 //       ARCORE_ASSUMED_START_HEIGHT_M above the floor, and it eases toward the measured floor
 //       height instead of jumping.
-constexpr int ARCORE_HEIGHT_MODE = 2;
+constexpr int ARCORE_HEIGHT_MODE = 0;
 // Mode 2 only: assumed height above the floor at the start, before any floor has been detected.
 constexpr float ARCORE_ASSUMED_START_HEIGHT_M = 1.5f;
 // Mode 2 only: how slowly the height eases toward the measured floor. Larger = slower.
@@ -151,6 +158,7 @@ struct NativeContext {
     float arPosition[3] = {0.f, 0.f, 0.f};
     AlvrQuat orientationCorrection = {0.f, 0.f, 0.f, 1.f};
     uint64_t lastCorrectionNs = 0;
+    uint64_t disagreeSinceNs = 0;  // when ARCore started disagreeing with the correction, or 0
 
     int screenWidth = 0;
     int screenHeight = 0;
@@ -517,9 +525,17 @@ static void updateARCoreTracking() {
     // The rotation that would take Cardboard's orientation onto ARCore's.
     AlvrQuat relative =
         normalizeQuat(quatMultiply(quatInverse(cardboardOrientation), arcoreInCardboard));
-    float errorDeg = quatAngleDegrees(relative);
+    // How far Cardboard has drifted from ARCore in total (what the correction has to cancel).
+    float offsetDeg = quatAngleDegrees(relative);
 
-    bool accepted = errorDeg < ARCORE_MAX_ORIENTATION_ERROR_DEG;
+    static int acceptedCount = 0;
+    static int rejectedCount = 0;
+    static float maxResidualDeg = 0.0f;
+    static bool wasReacquiring = false;
+
+    float residualDeg = 0.0f;
+    bool accepted = false;
+    bool reacquiring = false;
     float correctionDeg = 0.0f;
 
     {
@@ -530,6 +546,21 @@ static void updateARCoreTracking() {
         CTX.arPosition[2] = raw[6];
         CTX.arPositionValid = true;
 
+        // How much ARCore disagrees with what is being shown right now (Cardboard + correction).
+        AlvrQuat residual =
+            normalizeQuat(quatMultiply(quatInverse(CTX.orientationCorrection), relative));
+        residualDeg = quatAngleDegrees(residual);
+
+        bool agrees = residualDeg < ARCORE_MAX_RESIDUAL_DEG;
+        if (agrees) {
+            CTX.disagreeSinceNs = 0;
+        } else if (CTX.disagreeSinceNs == 0) {
+            CTX.disagreeSinceNs = nowNs;
+        }
+        uint64_t reacquireAfterNs = (uint64_t) (ARCORE_REACQUIRE_AFTER_S * 1e9f);
+        reacquiring = !agrees && (nowNs - CTX.disagreeSinceNs) >= reacquireAfterNs;
+        accepted = agrees || reacquiring;
+
         if (accepted) {
             if (CTX.lastCorrectionNs == 0) {
                 CTX.lastCorrectionNs = nowNs;
@@ -538,8 +569,10 @@ static void updateARCoreTracking() {
             // Protect against an unexpectedly large gap (pause, debugger, lifecycle change).
             if (deltaNs > 0 && deltaNs < ARCORE_MAX_CORRECTION_GAP_NS) {
                 float dt = (float) deltaNs * 1e-9f;
+                float timeConstant =
+                    agrees ? ARCORE_CORRECTION_TIME_CONSTANT_S : ARCORE_REACQUIRE_TIME_CONSTANT_S;
                 // Time-based gain, so the result doesn't depend on the frame rate.
-                float gain = 1.0f - std::exp(-dt / ARCORE_CORRECTION_TIME_CONSTANT_S);
+                float gain = 1.0f - std::exp(-dt / timeConstant);
                 CTX.orientationCorrection =
                     slerpQuat(CTX.orientationCorrection, relative, gain);
             }
@@ -552,12 +585,30 @@ static void updateARCoreTracking() {
         correctionDeg = quatAngleDegrees(CTX.orientationCorrection);
     }
 
+    if (accepted) {
+        acceptedCount++;
+    } else {
+        rejectedCount++;
+    }
+    maxResidualDeg = std::max(maxResidualDeg, residualDeg);
+    if (reacquiring && !wasReacquiring) {
+        info("ARCore: orientation disagreed for %.1f s (residual %.1f deg, offset %.1f deg); "
+             "following ARCore's new orientation",
+             ARCORE_REACQUIRE_AFTER_S, residualDeg, offsetDeg);
+    }
+    wasReacquiring = reacquiring;
+
     if (shouldLog) {
         lastLogNs = nowNs;
-        info("ARCore: tracking, position=(%.3f, %.3f, %.3f), floor %s (y=%.2f) | orientation "
-             "error=%.2f deg, correction=%.2f deg, sample %s",
-             raw[4], headY, raw[6], floorKnown ? "known" : "unknown", floorY, errorDeg,
-             correctionDeg, accepted ? "accepted" : "rejected");
+        info("ARCore: tracking, position=(%.3f, %.3f, %.3f), floor %s (y=%.2f) | offset from "
+             "ARCore=%.2f deg, residual=%.2f deg (max %.2f), correction=%.2f deg, last second: "
+             "%d accepted, %d rejected%s",
+             raw[4], headY, raw[6], floorKnown ? "known" : "unknown", floorY, offsetDeg,
+             residualDeg, maxResidualDeg, correctionDeg, acceptedCount, rejectedCount,
+             reacquiring ? ", RE-ACQUIRING" : "");
+        acceptedCount = 0;
+        rejectedCount = 0;
+        maxResidualDeg = 0.0f;
     }
 }
 
