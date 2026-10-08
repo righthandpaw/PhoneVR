@@ -110,6 +110,11 @@ constexpr uint64_t ARCORE_MAX_CORRECTION_GAP_NS = 500000000ULL;
 // (landscape-left). Found by calibration on one phone; other phones may need other values.
 const AlvrQuat ARCORE_TO_CARDBOARD = {-0.0057f, -0.0031f, 0.7076f, 0.7066f};
 
+// Which axis is "up" in the orientation this file works with (0 = x, 1 = y, 2 = z). The yaw
+// correction is a rotation about this axis. The log prints a "tilt disagreement" that should stay
+// small (a few degrees); if it is large, this axis is probably wrong.
+constexpr int ARCORE_WORLD_UP_AXIS = 1;
+
 // ---- ARCore head height ----
 // How the vertical position is derived:
 //   0 = relative to where ARCore started (height starts at 0, as in the earlier builds).
@@ -156,7 +161,8 @@ struct NativeContext {
     std::mutex poseMutex;
     bool arPositionValid = false;
     float arPosition[3] = {0.f, 0.f, 0.f};
-    AlvrQuat orientationCorrection = {0.f, 0.f, 0.f, 1.f};
+    // Yaw (rotation about the world's up axis) added to Cardboard's orientation, in radians.
+    float yawCorrectionRad = 0.f;
     uint64_t lastCorrectionNs = 0;
     uint64_t disagreeSinceNs = 0;  // when ARCore started disagreeing with the correction, or 0
 
@@ -271,35 +277,25 @@ static float quatAngleDegrees(const AlvrQuat &q) {
     return 2.0f * std::acos(w) * 180.0f / (float) M_PI;
 }
 
-static AlvrQuat slerpQuat(AlvrQuat a, AlvrQuat b, float t) {
-    a = normalizeQuat(a);
-    b = normalizeQuat(b);
-
-    float dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
-
-    // Take the shortest path.
-    if (dot < 0.0f) {
-        b = {-b.x, -b.y, -b.z, -b.w};
-        dot = -dot;
+// Wraps an angle to the range [-pi, pi].
+static float wrapRad(float angle) {
+    const float twoPi = 2.0f * (float) M_PI;
+    while (angle > (float) M_PI) {
+        angle -= twoPi;
     }
-
-    // Very close: normalized linear interpolation is enough.
-    if (dot > 0.9995f) {
-        return normalizeQuat({a.x + t * (b.x - a.x),
-                              a.y + t * (b.y - a.y),
-                              a.z + t * (b.z - a.z),
-                              a.w + t * (b.w - a.w)});
+    while (angle < -(float) M_PI) {
+        angle += twoPi;
     }
+    return angle;
+}
 
-    float theta = std::acos(dot);
-    float sinTheta = std::sin(theta);
-    float wa = std::sin((1.0f - t) * theta) / sinTheta;
-    float wb = std::sin(t * theta) / sinTheta;
-
-    return normalizeQuat({wa * a.x + wb * b.x,
-                          wa * a.y + wb * b.y,
-                          wa * a.z + wb * b.z,
-                          wa * a.w + wb * b.w});
+// A rotation about the world's up axis.
+static AlvrQuat worldYawQuat(float angleRad) {
+    float s = std::sin(angleRad * 0.5f);
+    float c = std::cos(angleRad * 0.5f);
+    float axis[3] = {0.f, 0.f, 0.f};
+    axis[ARCORE_WORLD_UP_AXIS] = s;
+    return {axis[0], axis[1], axis[2], c};
 }
 
 // Cardboard's orientation at the given time, in the same convention the rest of this file uses.
@@ -312,8 +308,9 @@ static AlvrQuat cardboardOrientationAt(uint64_t timestampNs) {
 
 // Head pose, in world/tracking space (not head-relative). Safe to call from any thread.
 //
-// Orientation: Cardboard's fast gyro orientation, multiplied by a slowly changing correction that
-// the render thread computes from ARCore (updateARCoreTracking). This is what removes the drift.
+// Orientation: Cardboard's fast gyro orientation, turned about the vertical by a slowly changing
+// yaw correction that the render thread computes from ARCore (updateARCoreTracking). Gyro drift
+// is a turn about the vertical, so this is what removes it.
 // Position: ARCore's last known position, or the origin until ARCore has tracked (3DoF).
 AlvrPose getPose(uint64_t timestampNs) {
     AlvrPose pose = {};
@@ -324,7 +321,8 @@ AlvrPose getPose(uint64_t timestampNs) {
         std::lock_guard<std::mutex> lock(CTX.poseMutex);
 
         if (ARCORE_USE_ORIENTATION_CORRECTION) {
-            orientation = normalizeQuat(quatMultiply(orientation, CTX.orientationCorrection));
+            orientation =
+                normalizeQuat(quatMultiply(worldYawQuat(CTX.yawCorrectionRad), orientation));
         }
 
         if (ARCORE_USE_POSITION && CTX.arPositionValid) {
@@ -522,15 +520,29 @@ static void updateARCoreTracking() {
     AlvrQuat arcoreOrientation = normalizeQuat(AlvrQuat{raw[0], raw[1], raw[2], raw[3]});
     AlvrQuat arcoreInCardboard =
         normalizeQuat(quatMultiply(arcoreOrientation, quatInverse(ARCORE_TO_CARDBOARD)));
-    // The rotation that would take Cardboard's orientation onto ARCore's.
-    AlvrQuat relative =
-        normalizeQuat(quatMultiply(quatInverse(cardboardOrientation), arcoreInCardboard));
-    // How far Cardboard has drifted from ARCore in total (what the correction has to cancel).
-    float offsetDeg = quatAngleDegrees(relative);
+
+    // The rotation, in world space, that takes Cardboard's orientation onto ARCore's. Both sensors
+    // know which way is down, so this is (nearly) a pure rotation about the vertical: the yaw
+    // drift. Splitting off that yaw (and treating what is left as "tilt") makes the correction
+    // independent of where the head is pointing. A correction expressed in the phone's own frame
+    // is only right while the head keeps the pose it was measured in.
+    AlvrQuat worldOffset =
+        normalizeQuat(quatMultiply(arcoreInCardboard, quatInverse(cardboardOrientation)));
+    if (worldOffset.w < 0.0f) {
+        worldOffset = {-worldOffset.x, -worldOffset.y, -worldOffset.z, -worldOffset.w};
+    }
+    const float offsetComponents[3] = {worldOffset.x, worldOffset.y, worldOffset.z};
+    float measuredYawRad =
+        2.0f * std::atan2(offsetComponents[ARCORE_WORLD_UP_AXIS], worldOffset.w);
+    AlvrQuat tilt = normalizeQuat(
+        quatMultiply(quatInverse(worldYawQuat(measuredYawRad)), worldOffset));
+    float tiltDeg = quatAngleDegrees(tilt);
+    float yawOffsetDeg = measuredYawRad * 180.0f / (float) M_PI;
 
     static int acceptedCount = 0;
     static int rejectedCount = 0;
     static float maxResidualDeg = 0.0f;
+    static float maxTiltDeg = 0.0f;
     static bool wasReacquiring = false;
 
     float residualDeg = 0.0f;
@@ -546,10 +558,9 @@ static void updateARCoreTracking() {
         CTX.arPosition[2] = raw[6];
         CTX.arPositionValid = true;
 
-        // How much ARCore disagrees with what is being shown right now (Cardboard + correction).
-        AlvrQuat residual =
-            normalizeQuat(quatMultiply(quatInverse(CTX.orientationCorrection), relative));
-        residualDeg = quatAngleDegrees(residual);
+        // How much ARCore disagrees with the yaw being applied right now.
+        float residualRad = wrapRad(measuredYawRad - CTX.yawCorrectionRad);
+        residualDeg = std::abs(residualRad) * 180.0f / (float) M_PI;
 
         bool agrees = residualDeg < ARCORE_MAX_RESIDUAL_DEG;
         if (agrees) {
@@ -573,8 +584,7 @@ static void updateARCoreTracking() {
                     agrees ? ARCORE_CORRECTION_TIME_CONSTANT_S : ARCORE_REACQUIRE_TIME_CONSTANT_S;
                 // Time-based gain, so the result doesn't depend on the frame rate.
                 float gain = 1.0f - std::exp(-dt / timeConstant);
-                CTX.orientationCorrection =
-                    slerpQuat(CTX.orientationCorrection, relative, gain);
+                CTX.yawCorrectionRad = wrapRad(CTX.yawCorrectionRad + residualRad * gain);
             }
             CTX.lastCorrectionNs = nowNs;
         } else {
@@ -582,7 +592,7 @@ static void updateARCoreTracking() {
             CTX.lastCorrectionNs = nowNs;
         }
 
-        correctionDeg = quatAngleDegrees(CTX.orientationCorrection);
+        correctionDeg = CTX.yawCorrectionRad * 180.0f / (float) M_PI;
     }
 
     if (accepted) {
@@ -591,24 +601,26 @@ static void updateARCoreTracking() {
         rejectedCount++;
     }
     maxResidualDeg = std::max(maxResidualDeg, residualDeg);
+    maxTiltDeg = std::max(maxTiltDeg, tiltDeg);
     if (reacquiring && !wasReacquiring) {
-        info("ARCore: orientation disagreed for %.1f s (residual %.1f deg, offset %.1f deg); "
-             "following ARCore's new orientation",
-             ARCORE_REACQUIRE_AFTER_S, residualDeg, offsetDeg);
+        info("ARCore: yaw disagreed for %.1f s (residual %.1f deg, offset %.1f deg); following "
+             "ARCore's new yaw",
+             ARCORE_REACQUIRE_AFTER_S, residualDeg, yawOffsetDeg);
     }
     wasReacquiring = reacquiring;
 
     if (shouldLog) {
         lastLogNs = nowNs;
-        info("ARCore: tracking, position=(%.3f, %.3f, %.3f), floor %s (y=%.2f) | offset from "
-             "ARCore=%.2f deg, residual=%.2f deg (max %.2f), correction=%.2f deg, last second: "
-             "%d accepted, %d rejected%s",
-             raw[4], headY, raw[6], floorKnown ? "known" : "unknown", floorY, offsetDeg,
-             residualDeg, maxResidualDeg, correctionDeg, acceptedCount, rejectedCount,
-             reacquiring ? ", RE-ACQUIRING" : "");
+        info("ARCore: tracking, position=(%.3f, %.3f, %.3f), floor %s (y=%.2f) | yaw offset from "
+             "ARCore=%.2f deg, residual=%.2f deg (max %.2f), yaw correction=%.2f deg, tilt "
+             "disagreement=%.2f deg (max %.2f), last second: %d accepted, %d rejected%s",
+             raw[4], headY, raw[6], floorKnown ? "known" : "unknown", floorY, yawOffsetDeg,
+             residualDeg, maxResidualDeg, correctionDeg, tiltDeg, maxTiltDeg, acceptedCount,
+             rejectedCount, reacquiring ? ", RE-ACQUIRING" : "");
         acceptedCount = 0;
         rejectedCount = 0;
         maxResidualDeg = 0.0f;
+        maxTiltDeg = 0.0f;
     }
 }
 
