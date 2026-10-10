@@ -90,6 +90,13 @@ const int MAXIMUM_TRACKING_FRAMES = 360;
 
 // ---- ARCore tuning (values carried over from the v20 branch; tuned on one phone only) ----
 // Use ARCore's position as the head position (otherwise position stays at the origin: 3DoF).
+// Some phones (seen on an AQUOS sense4 basic, Adreno 618, Android 12) stop delivering decoded
+// video frames while the ARCore camera session is running. With this set, ARCore is only
+// started once the video decoder has produced a few frames, and it is paused again when the
+// stream stops. Set to false to start ARCore together with the app, as before.
+constexpr bool ARCORE_START_AFTER_VIDEO = true;
+constexpr int ARCORE_START_AFTER_VIDEO_FRAMES = 10;
+
 constexpr bool ARCORE_USE_POSITION = true;
 // Slowly pull Cardboard's drifting orientation toward ARCore's (complementary filter).
 constexpr bool ARCORE_USE_ORIENTATION_CORRECTION = true;
@@ -145,6 +152,8 @@ struct NativeContext {
     // concurrently, so every use of arSession is guarded by arMutex. ArSession_update() must
     // additionally run on the render thread, with the app's EGL context current.
     bool arcoreEnabled = false;
+    bool arSessionRunning = false;  // ArSession_resume() done and not yet paused; under arMutex
+    int videoFramesSeen = 0;        // decoded frames since the stream started (render thread)
     ArSession *arSession = nullptr;
     ArFrame *arFrame = nullptr;
     // Anchor on the lowest horizontal plane found so far (taken to be the floor). An anchor keeps
@@ -434,6 +443,38 @@ static bool updateFloorAnchor(float *outFloorY) {
 // Updates ARCore once per render frame and publishes what getPose() needs: the ARCore position
 // and the orientation correction. Must be called from the render thread, with the app's EGL
 // context current (ArSession_update requires it).
+// Starts the ARCore camera session (no-op if it is already running or ARCore is off).
+static void startARCoreSession(const char *why) {
+    std::lock_guard<std::mutex> lock(CTX.arMutex);
+    if (!CTX.arcoreEnabled || CTX.arSession == nullptr || CTX.arSessionRunning) {
+        return;
+    }
+    ArStatus arStatus = ArSession_resume(CTX.arSession);
+    if (arStatus != AR_SUCCESS) {
+        info("ARCore ERROR: failed to resume session (status %d)", (int) arStatus);
+        return;
+    }
+    CTX.arSessionRunning = true;
+    info("ARCore: camera session started (%s)", why);
+}
+
+// Pauses the ARCore session, which releases the camera (no-op if it is not running).
+static void stopARCoreSession(const char *why) {
+    {
+        std::lock_guard<std::mutex> lock(CTX.arMutex);
+        if (!CTX.arcoreEnabled || CTX.arSession == nullptr || !CTX.arSessionRunning) {
+            return;
+        }
+        ArSession_pause(CTX.arSession);
+        CTX.arSessionRunning = false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(CTX.poseMutex);
+        CTX.arPositionValid = false;
+    }
+    info("ARCore: camera session paused (%s)", why);
+}
+
 static void updateARCoreTracking() {
     if (!CTX.arcoreEnabled || CTX.arTexture == 0) {
         return;
@@ -444,7 +485,7 @@ static void updateARCoreTracking() {
     }
 
     std::lock_guard<std::mutex> lock(CTX.arMutex);
-    if (CTX.arSession == nullptr || CTX.arFrame == nullptr) {
+    if (CTX.arSession == nullptr || CTX.arFrame == nullptr || !CTX.arSessionRunning) {
         return;
     }
 
@@ -775,14 +816,8 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_resume
                                                                                        jobject) {
     CardboardHeadTracker_resume(CTX.headTracker);
 
-    {
-        std::lock_guard<std::mutex> lock(CTX.arMutex);
-        if (CTX.arcoreEnabled && CTX.arSession != nullptr) {
-            ArStatus arStatus = ArSession_resume(CTX.arSession);
-            if (arStatus != AR_SUCCESS) {
-                info("ARCore ERROR: failed to resume session (status %d)", (int) arStatus);
-            }
-        }
+    if (!ARCORE_START_AFTER_VIDEO) {
+        startARCoreSession("app resumed");
     }
 
     CTX.renderingParamsChanged = true;
@@ -814,12 +849,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_pauseN
     CardboardHeadTracker_pause(CTX.headTracker);
 
     // Releases the camera. (The v20 code never paused the ARCore session.)
-    {
-        std::lock_guard<std::mutex> lock(CTX.arMutex);
-        if (CTX.arcoreEnabled && CTX.arSession != nullptr) {
-            ArSession_pause(CTX.arSession);
-        }
-    }
+    stopARCoreSession("app paused");
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1025,6 +1055,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             // the v20 code did).
             CTX.hasFrameMetadata = false;
             CTX.lastStreamBuffer = nullptr;
+            CTX.videoFramesSeen = 0;
 
             GL(glGenTextures(2, CTX.streamTextures));
 
@@ -1152,6 +1183,11 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             CTX.streaming = false;
             CTX.inputThread.join();
 
+            // The camera must be off before the next decoder is created.
+            if (ARCORE_START_AFTER_VIDEO) {
+                stopARCoreSession("stream stopped");
+            }
+
             // The saved frame belongs to the decoder that is about to be destroyed.
             CTX.lastStreamBuffer = nullptr;
             if (g_decoderCreated) {
@@ -1190,8 +1226,17 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
         // below.
         bool isNewFrame = alvr_get_frame(&timestampNs, &streamHardwareBuffer);
 
+        // DIAGNOSTIC (phone-1 freeze): count what the stream branch does, log once a second.
+        static uint64_t diagLastNs = 0, diagCalls = 0, diagNew = 0, diagNoMeta = 0, diagRendered = 0;
+        diagCalls++;
+        if (isNewFrame) diagNew++;
+
         AlvrVideoFrameMetadata metadata;
         if (isNewFrame) {
+            if (ARCORE_START_AFTER_VIDEO && CTX.videoFramesSeen < ARCORE_START_AFTER_VIDEO_FRAMES &&
+                ++CTX.videoFramesSeen >= ARCORE_START_AFTER_VIDEO_FRAMES) {
+                startARCoreSession("video is flowing");
+            }
             CTX.lastStreamBuffer = streamHardwareBuffer;
             CTX.lastStreamTimestampNs = timestampNs;
 
@@ -1206,6 +1251,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                 metadata = CTX.lastFrameMetadata;
             } else {
                 // No metadata at all yet (first frame) - nothing sensible to reproject against.
+                diagNoMeta++;
                 return;
             }
         } else if (CTX.lastStreamBuffer != nullptr && CTX.hasFrameMetadata) {
@@ -1215,6 +1261,12 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             metadata = CTX.lastFrameMetadata;
         } else {
             // Nothing has been decoded yet.
+            {
+                static uint64_t lastNs = 0; uint64_t n = GetBootTimeNano();
+                if (n - lastNs > 1000000000ULL) { lastNs = n;
+                    __android_log_print(ANDROID_LOG_INFO, "ALVR_PVR_NATIVE",
+                        "DIAG stream: no decoded frame yet (alvr_get_frame returned false, calls=%llu)", (unsigned long long)diagCalls); }
+            }
             return;
         }
 
@@ -1240,6 +1292,18 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
         ALVR_GL_CALL(
             alvr_render_stream_opengl(streamHardwareBuffer, streamViewParams, foveationCenters));
         EGLCHK("after alvr_render_stream_opengl()");
+        diagRendered++;
+        {
+            uint64_t nowNs = GetBootTimeNano();
+            if (nowNs - diagLastNs > 1000000000ULL) {
+                __android_log_print(ANDROID_LOG_INFO, "ALVR_PVR_NATIVE",
+                    "DIAG stream: calls=%llu newFrames=%llu noMetadataReturns=%llu rendered=%llu lastTs=%llu glError=0x%x",
+                    (unsigned long long)diagCalls, (unsigned long long)diagNew,
+                    (unsigned long long)diagNoMeta, (unsigned long long)diagRendered,
+                    (unsigned long long)timestampNs, glGetError());
+                diagLastNs = nowNs; diagCalls = diagNew = diagNoMeta = diagRendered = 0;
+            }
+        }
 
         // The statistics are per decoded frame, so only report frames that are new.
         if (isNewFrame) {
