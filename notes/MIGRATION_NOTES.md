@@ -1,27 +1,34 @@
 # PhoneVR: ALVR v20 -> v21 migration notes
 
-Last updated: 2026-10-05
+Last updated: 2026-10-10
 
 ## Status
 
-The Android client (the `main` flavor, built on `alvr_client_core`) now connects to an ALVR v21
+The Android client (the `main` flavor, built on `alvr_client_core`) connects to an ALVR v21
 streamer, decodes video on the phone's hardware decoder (H.264 and HEVC verified) and renders it
 through the Cardboard distortion renderer. Head orientation comes from the Cardboard head tracker
-(3DoF). Position is not tracked yet.
+and, on phones with ARCore, ARCore adds position tracking and corrects Cardboard's yaw drift
+(see `ARCORE_NOTES.md`). On phones without ARCore the client runs as 3DoF.
 
 - **ALVR version:** v21 is not a tagged release. It is the `master` branch of `alvr-org/ALVR`
   (the main repo's newest tag is still v20.14.1). This port was built against commit `9f118394`
   (`21.0.0-dev14`). The client library header from `dc84d683` (also `21.0.0-dev14`) is identical.
-- **Test device:** an Android phone with an Adreno 619 GPU, OpenGL ES 3.2, with
-  `GL_OES_EGL_image_external` supported.
 - **Build host:** Ubuntu in VirtualBox, JDK 17, Rust 1.97.1, Android NDK 25.2.9519653.
+
+### Tested devices
+
+| Phone | Android | GPU | ARCore | Result |
+|---|---|---|---|---|
+| Oppo Reno 9 A | 14 | Adreno 619 | yes | Works: video, 6DoF position, drift-free yaw |
+| AQUOS sense4 basic | 12 | Adreno 618 | yes | Works after section 4.4 (start ARCore after video) |
+| UMIDIGI A3S | 10 | PowerVR Rogue GE8300 (MediaTek) | no | Works as 3DoF after section 4.5 (GL debug output off) |
 
 ## 1. Build configuration changes
 
-No source folders were removed in this branch. `app/src/gvr/`, `app/src/androidTestGvr/` and
-`code/mobile/mobile-common/` are still present. They belong to the legacy custom-protocol client
-and should no longer be built, because the build files below were changed to produce only the
-ALVR-based variant. They can be deleted in a later cleanup.
+> **TODO (verify before publishing):** the first version of these notes said the folders
+> `app/src/gvr/`, `app/src/androidTestGvr/` and `code/mobile/mobile-common/` were deleted. Check
+> with `ls` whether they still exist in this branch. If they do, delete this note and the
+> assumption that they are gone; if they were removed, say so here.
 
 The build files were changed to produce a single ALVR-based variant (from the original port notes):
 
@@ -72,7 +79,8 @@ differences. The Gradle `buildClientLib` task regenerates this file on every bui
   `alvr_initialize_opengl()` while its own context is current (it does, in `surfaceCreatedNative`).
   The patch is in `code/mobile/android/PhoneVR/patches/wgpu-hal-25.0.2-share-egl-context.patch`.
   It also contains some `ALVR GLES` debug log lines that can be dropped; the essential change is
-  replacing `None` with `share_context` in the `create_context` calls.
+  replacing `None` with `share_context` in the `create_context` calls. The same patch also holds the
+  change from section 4.5 (GL debug output and the debug EGL context switched off).
 - **Related workaround:** the `alvr_*_opengl()` calls make Rust's context current and leave the
   thread with none, so `alvr_main.cpp` restores the app's EGL state afterwards (`EglStateGuard`).
 
@@ -97,6 +105,41 @@ differences. The Gradle `buildClientLib` task regenerates this file on every bui
   H.264 and HEVC. The generic `low-latency` key is deliberately not set; ALVR's own settings code
   notes it crashes some Android phones.
 
+### 4.4 ARCore's camera stops decoded video on some phones
+
+- **Symptom:** on an AQUOS sense4 basic (Android 12, Adreno 618) the lobby froze the instant the
+  stream started, while SteamVR still received poses. The streamer logs (resolution clamp,
+  "refresh rate not supported, using 60.000004Hz", a GLES `FreeAllocationOnTimestamp` message) were
+  harmless. The stock ALVR OpenXR client worked on the same phone.
+- **Finding:** the hardware decoder started and consumed about 60 frames a second, but
+  `alvr_get_frame()` never returned a frame, on every render call. With ARCore turned off
+  (`initializeNative(..., false)`) video appeared at once. A software-decoder test was not
+  conclusive: on that phone the software decoder could not be created and the call to create it
+  hung.
+- **Cause (not fully identified):** the ARCore camera session and the video decoder do not work
+  together when the camera starts first. The exact shared resource was not determined.
+- **Fix:** `ARCORE_START_AFTER_VIDEO` (default `true`). ARCore is not resumed when the app resumes;
+  it is started after `ARCORE_START_AFTER_VIDEO_FRAMES` (10) decoded frames have arrived, and it is
+  paused again when the stream stops, so the camera is off when the next decoder is created.
+  Verified on the Oppo Reno 9 A and the AQUOS. Expect ARCore tracking to restart (and the position
+  to jump slightly) at each stream start.
+
+### 4.5 PowerVR GE8300 driver crash when GL debug output is on
+
+- **Symptom:** on a UMIDIGI A3S (Android 10, MediaTek, PowerVR Rogue GE8300, OpenGL ES 3.2
+  build 1.11) the app crashed with SIGSEGV on the first lobby draw, with or without ARCore.
+  The old v20 client, which drew with its own C++ renderer, worked on this phone.
+- **Crash location:** inside the vendor driver (`libGLESv2_mtk.so`), called from `glTexSubImage2D`
+  for a plain 1024x1024 RGBA8 upload from a GL buffer, in the driver's own `vsnprintf`/`strlen`
+  with a garbage pointer (the fault address was the texture's width and height packed together).
+- **Cause:** wgpu-hal enabled GL debug output (`DEBUG_OUTPUT` plus a debug callback) and a debug EGL
+  context. This driver crashes while formatting one of its own debug messages. Changing the pixel
+  store row length / image height for the upload made no difference.
+- **Fix:** in the patched `wgpu-hal` (`src/gles/egl.rs`), `false &&` guards disable both the GL
+  debug output and the debug EGL context. No functionality is lost; only driver diagnostics
+  (such as the `[Other/Performance]` messages seen on Adreno) disappear from the log. Verified on
+  the A3S and on the other two phones.
+
 ## 5. Setting up the ALVR side
 
 1. Check out ALVR at the commit above and build as usual (`prepare-alvr-deps.sh`, which runs
@@ -114,17 +157,26 @@ differences. The Gradle `buildClientLib` task regenerates this file on every bui
 
 ## 6. Known issues and not done yet
 
-- **ARCore and drift correction:** not integrated on this branch. `getPose()` in `alvr_main.cpp`
-  is the extension point; it currently returns Cardboard's gyro-only orientation with position
-  fixed at the origin.
-- **Stuttering:** present in v20 as well. A fix exists on the author's separate v20 ARCore branch
-  and has not been merged here. Weak Wi-Fi also contributed in testing.
+- **ARCore:** integrated (see `ARCORE_NOTES.md` for the design and tuning constants). Not yet done:
+  per-phone calibration of `ARCORE_TO_CARDBOARD` (a fixed value measured on one phone), trying a
+  newer ARCore than 1.46.0, pinning the ARCore C headers (currently downloaded from `main`) to the
+  tag matching the library, adding `<meta-data android:name="com.google.ar.core" android:value="optional" />`
+  to the manifest, and checking how the height setting feels in a headset.
+- **Stuttering:** fixed. When no new decoded frame is available the client draws the previous
+  frame again, reprojected to the current head pose.
+- **Diagnostics left in the code:** `DIAG stream` log lines in the stream branch of `alvr_main.cpp`
+  and the `ALVR GLES` log lines in the `wgpu-hal` patch can be removed before a release.
 - **Stale decoder-config event:** a `DECODER_CONFIG` event arrives after each `STREAMING_STOPPED`,
   and the handler creates a decoder while no stream is active. Harmless so far, but it should be
   tidied.
+- **Software decoder:** `FORCE_SOFTWARE_DECODER` is a compile-time switch, left `false`. On at least
+  one Android 12 phone the software decoder ALVR asks for cannot be created and the call to create
+  it hangs, so do not rely on it as a fallback.
 - **Patch path:** the `wgpu-hal` patch is referenced by an absolute path on the development
-  machine, which must be replaced before others can build this.
+  machine in ALVR's `Cargo.toml`, which must be replaced before others can build this.
 - **CI:** `.github/workflows/build.yml` and `release.yml` still reference the removed
   `gvr` / `noGvr` Gradle tasks and will need simplifying before CI can pass.
+- **Upstream:** the wgpu-hal EGL share-context bug (section 4.1) is worth reporting to the ALVR
+  developers.
 - **Likely obsolete:** `driver/PVRServer` and `code/windows` (the PC side of the legacy
   protocol). Left untouched.
