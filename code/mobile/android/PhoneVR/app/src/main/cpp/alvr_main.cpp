@@ -1112,36 +1112,13 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
              * separate event, ALVR_EVENT_DECODER_CONFIG, which is guaranteed to arrive before
              * the first frame.
              */
-            /*
             if (!g_decoderCreated) {
                 auto configSize = alvr_get_decoder_config(nullptr);
                 auto configBuffer = std::vector<char>(configSize);
                 alvr_get_decoder_config(configBuffer.data());
 
-                AlvrDecoderConfig decoderConfig = {};
-                decoderConfig.codec = event.DECODER_CONFIG.codec;
-                decoderConfig.force_software_decoder = true;
-                decoderConfig.max_buffering_frames = 1.5f;
-                decoderConfig.buffering_history_weight = 0.9f;
-                decoderConfig.options = nullptr;
-                decoderConfig.options_count = 0;
-                decoderConfig.config_buffer =
-                    reinterpret_cast<const uint8_t *>(configBuffer.data());
-                decoderConfig.config_buffer_size = configSize;
-
-                info("ALVR Poll Event: ALVR_EVENT_DECODER_CONFIG, codec=%d, config bytes=%llu",
-                     (int) decoderConfig.codec, (unsigned long long) configSize);
-                alvr_create_decoder(decoderConfig);
-                g_decoderCreated = true;
-            }
-            */
-
-            if (!g_decoderCreated) {
-                auto configSize = alvr_get_decoder_config(nullptr);
-                auto configBuffer = std::vector<char>(configSize);
-                alvr_get_decoder_config(configBuffer.data());
-
-                // false = try the phone's hardware decoder; flip to true if it fails again.
+                // false = use the phone's hardware decoder. true forces ALVR's software decoder,
+                // which cannot be created on some phones (creating it then hangs), so leave it false.
                 constexpr bool FORCE_SOFTWARE_DECODER = false;
 
                 // Same options the stock ALVR client gets from the server's defaults.
@@ -1226,11 +1203,6 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
         // below.
         bool isNewFrame = alvr_get_frame(&timestampNs, &streamHardwareBuffer);
 
-        // DIAGNOSTIC (phone-1 freeze): count what the stream branch does, log once a second.
-        static uint64_t diagLastNs = 0, diagCalls = 0, diagNew = 0, diagNoMeta = 0, diagRendered = 0;
-        diagCalls++;
-        if (isNewFrame) diagNew++;
-
         AlvrVideoFrameMetadata metadata;
         if (isNewFrame) {
             if (ARCORE_START_AFTER_VIDEO && CTX.videoFramesSeen < ARCORE_START_AFTER_VIDEO_FRAMES &&
@@ -1251,7 +1223,6 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                 metadata = CTX.lastFrameMetadata;
             } else {
                 // No metadata at all yet (first frame) - nothing sensible to reproject against.
-                diagNoMeta++;
                 return;
             }
         } else if (CTX.lastStreamBuffer != nullptr && CTX.hasFrameMetadata) {
@@ -1261,12 +1232,6 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             metadata = CTX.lastFrameMetadata;
         } else {
             // Nothing has been decoded yet.
-            {
-                static uint64_t lastNs = 0; uint64_t n = GetBootTimeNano();
-                if (n - lastNs > 1000000000ULL) { lastNs = n;
-                    __android_log_print(ANDROID_LOG_INFO, "ALVR_PVR_NATIVE",
-                        "DIAG stream: no decoded frame yet (alvr_get_frame returned false, calls=%llu)", (unsigned long long)diagCalls); }
-            }
             return;
         }
 
@@ -1292,18 +1257,6 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
         ALVR_GL_CALL(
             alvr_render_stream_opengl(streamHardwareBuffer, streamViewParams, foveationCenters));
         EGLCHK("after alvr_render_stream_opengl()");
-        diagRendered++;
-        {
-            uint64_t nowNs = GetBootTimeNano();
-            if (nowNs - diagLastNs > 1000000000ULL) {
-                __android_log_print(ANDROID_LOG_INFO, "ALVR_PVR_NATIVE",
-                    "DIAG stream: calls=%llu newFrames=%llu noMetadataReturns=%llu rendered=%llu lastTs=%llu glError=0x%x",
-                    (unsigned long long)diagCalls, (unsigned long long)diagNew,
-                    (unsigned long long)diagNoMeta, (unsigned long long)diagRendered,
-                    (unsigned long long)timestampNs, glGetError());
-                diagLastNs = nowNs; diagCalls = diagNew = diagNoMeta = diagRendered = 0;
-            }
-        }
 
         // The statistics are per decoded frame, so only report frames that are new.
         if (isNewFrame) {
