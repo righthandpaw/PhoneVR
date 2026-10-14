@@ -84,7 +84,7 @@ uint64_t HEAD_ID = alvr_path_string_to_id("/user/head");
 const uint64_t ESTIMATED_PREDICTION_OFFSET_NS = 30e6;
 
 // Note: the Cardboard SDK cannot estimate display time and an heuristic is used instead.
-const uint64_t VSYNC_QUEUE_INTERVAL_NS = 50e6;
+const uint64_t VSYNC_QUEUE_INTERVAL_NS = 30e6;
 const float FLOOR_HEIGHT = 1.5;
 const int MAXIMUM_TRACKING_FRAMES = 360;
 
