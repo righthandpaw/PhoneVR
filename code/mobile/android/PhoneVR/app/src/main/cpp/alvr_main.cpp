@@ -84,7 +84,29 @@ uint64_t HEAD_ID = alvr_path_string_to_id("/user/head");
 const uint64_t ESTIMATED_PREDICTION_OFFSET_NS = 30e6;
 
 // Note: the Cardboard SDK cannot estimate display time and an heuristic is used instead.
+// Tested on the Oppo Reno 9 A: 50 ms made the streamed picture overshoot when a fast head turn
+// stopped (felt over-sensitive); 30 ms removes that. Candidate for per-phone calibration.
 const uint64_t VSYNC_QUEUE_INTERVAL_NS = 30e6;
+
+// Client-side upscaling (ALVR's Snapdragon Game Super Resolution pass). The server streams a
+// smaller picture, the decoder works on that, and the client scales it up to (about) the phone's
+// real per-eye size. Only worth turning on when the stream is smaller than the display, e.g. to
+// save Wi-Fi bandwidth or decoder load: set the server's video resolution lower in the dashboard.
+// The upscale factor is worked out from the stream size, so there is nothing else to tune.
+constexpr bool ENABLE_UPSCALING = true;
+constexpr float UPSCALING_MAX_FACTOR = 3.0f;  // the same limit as ALVR's own slider
+// Same defaults as ALVR's own settings.
+constexpr bool UPSCALING_EDGE_DIRECTION = true;
+constexpr float UPSCALING_EDGE_THRESHOLD = 4.0f;
+constexpr float UPSCALING_EDGE_SHARPNESS = 2.0f;
+
+// Zoom of the streamed picture. The server renders with the field of view we report; reporting a
+// narrower one than the Cardboard lens really shows gives a bigger, closer-looking picture with
+// more pixels per degree (so text is easier to read). 1.0 = exactly what the lens geometry says.
+// The value scales the tangent of the half-angles, so 0.8 = about 25% zoom. The lobby is not
+// affected. Too small a value makes straight lines bend slightly toward the edges.
+// Tested on the Oppo Reno 9 A against the native client, which looked about 25% more zoomed in.
+constexpr float STREAM_FOV_SCALE = 0.8f;
 const float FLOOR_HEIGHT = 1.5;
 const int MAXIMUM_TRACKING_FRAMES = 360;
 
@@ -130,7 +152,7 @@ constexpr int ARCORE_WORLD_UP_AXIS = 1;
 //   2 = like 1, but until a floor is found it assumes the headset started
 //       ARCORE_ASSUMED_START_HEIGHT_M above the floor, and it eases toward the measured floor
 //       height instead of jumping.
-constexpr int ARCORE_HEIGHT_MODE = 0;
+constexpr int ARCORE_HEIGHT_MODE = 2;
 // Mode 2 only: assumed height above the floor at the start, before any floor has been detected.
 constexpr float ARCORE_ASSUMED_START_HEIGHT_M = 1.5f;
 // Mode 2 only: how slowly the height eases toward the measured floor. Larger = slower.
@@ -258,6 +280,17 @@ AlvrFov getFov(CardboardEye eye) {
     fov.up = f[3];
     fov.down = -f[2];
 
+    return fov;
+}
+
+// The field of view reported to the server, i.e. the one the stream is rendered with. The lobby
+// keeps using getFov() directly. See STREAM_FOV_SCALE.
+AlvrFov getStreamFov(CardboardEye eye) {
+    AlvrFov fov = getFov(eye);
+    fov.left = atanf(tanf(fov.left) * STREAM_FOV_SCALE);
+    fov.right = atanf(tanf(fov.right) * STREAM_FOV_SCALE);
+    fov.up = atanf(tanf(fov.up) * STREAM_FOV_SCALE);
+    fov.down = atanf(tanf(fov.down) * STREAM_FOV_SCALE);
     return fov;
 }
 
@@ -921,8 +954,8 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             CTX.eyeOffsets[eye] = matrix[12];
         }
 
-        CTX.fovArr[kLeft] = getFov(kLeft);
-        CTX.fovArr[kRight] = getFov(kRight);
+        CTX.fovArr[kLeft] = getStreamFov(kLeft);
+        CTX.fovArr[kRight] = getStreamFov(kRight);
 
         info("renderingParamsChanged, sending new view configs (FOV) to alvr");
         sendViewParams();
@@ -1057,6 +1090,30 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             CTX.lastStreamBuffer = nullptr;
             CTX.videoFramesSeen = 0;
 
+            // Upscaling: the stream is started_view_width x height, but when upscaling is on ALVR
+            // renders into textures that are upscale_factor times bigger (it truncates the
+            // product to whole pixels, exactly as done here), so the textures we hand over have
+            // to be that big too. A texture of the wrong size is what turned the screen black.
+            float upscaleFactor = 1.0f;
+            if (ENABLE_UPSCALING) {
+                float wantW = (float) (CTX.screenWidth / 2) / (float) started.view_width;
+                float wantH = (float) CTX.screenHeight / (float) started.view_height;
+                float want = std::min(wantW, wantH);
+                if (want >= 1.05f) {  // stream is clearly smaller than the display
+                    upscaleFactor = std::min(want, UPSCALING_MAX_FACTOR);
+                }
+            }
+            const bool upscaling = upscaleFactor > 1.0f;
+            const uint32_t targetWidth = (uint32_t) ((float) started.view_width * upscaleFactor);
+            const uint32_t targetHeight = (uint32_t) ((float) started.view_height * upscaleFactor);
+            info("Upscaling %s: stream %dx%d, factor %.3f, textures %ux%u",
+                 upscaling ? "ON" : "off",
+                 started.view_width,
+                 started.view_height,
+                 upscaleFactor,
+                 targetWidth,
+                 targetHeight);
+
             GL(glGenTextures(2, CTX.streamTextures));
 
             for (auto &streamTexture : CTX.streamTextures) {
@@ -1068,16 +1125,16 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
                 GL(glTexImage2D(GL_TEXTURE_2D,
                                 0,
                                 GL_RGB,
-                                started.view_width,
-                                started.view_height,
+                                targetWidth,
+                                targetHeight,
                                 0,
                                 GL_RGB,
                                 GL_UNSIGNED_BYTE,
                                 nullptr));
             }
 
-            CTX.fovArr[0] = getFov((CardboardEye) 0);
-            CTX.fovArr[1] = getFov((CardboardEye) 1);
+            CTX.fovArr[0] = getStreamFov((CardboardEye) 0);
+            CTX.fovArr[1] = getStreamFov((CardboardEye) 1);
             sendViewParams();
 
             info("ALVR Poll Event: ALVR_EVENT_STREAMING_STARTED, View configs updated...");
@@ -1095,8 +1152,15 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_render
             render_config.enable_foveation = started.enable_foveated_encoding;
             render_config.foveated_encoding = started.foveated_encoding;
 
-            // Not opting into server-side upscaling yet.
-            render_config.enable_upscaling = false;
+            // view_resolution above stays the size of the decoded stream; the textures are the
+            // upscaled size (see above).
+            render_config.enable_upscaling = upscaling;
+            if (upscaling) {
+                render_config.upscaling_edge_direction = UPSCALING_EDGE_DIRECTION;
+                render_config.upscaling_edge_threshold = UPSCALING_EDGE_THRESHOLD;
+                render_config.upscaling_edge_sharpness = UPSCALING_EDGE_SHARPNESS;
+                render_config.upscale_factor = upscaleFactor;
+            }
 
             ALVR_GL_CALL(alvr_start_stream_opengl(render_config));
 
