@@ -13,6 +13,8 @@ rustup target add \
 # mv ALVR-master ALVR
 # # mv ALVR-phonevr ALVR
 
+bash ./prepare-wgpu-hal.sh
+
 pushd ALVR
 cargo update
 cargo xtask prepare-deps --platform android $@
@@ -39,7 +41,13 @@ mv "${CARB_REPO_NAME}/sdk/build/outputs/aar/sdk-release.aar" cardboard/cardboard
 cp "${CARB_REPO_NAME}/sdk/include/cardboard.h" cardboard/cardboard.h
 rm -r "${CARB_REPO_NAME}"
 
-rm -rf "arcore-android-sdk-main"
-curl -sLS https://github.com/google-ar/arcore-android-sdk/archive/refs/heads/main.zip > download.zip
-unzip download.zip
+# ARCore C API headers and native library, pinned to a release so the build does not change when
+# Google updates the main branch. The version must match com.google.ar:core in app/build.gradle.
+# To try a newer ARCore, change the version here and the dependency there (tags: v1.46.0 ...).
+ARCORE_VERSION="1.46.0"
+rm -rf "arcore-android-sdk-main" "arcore-android-sdk-${ARCORE_VERSION}"
+curl -fsSL "https://github.com/google-ar/arcore-android-sdk/archive/refs/tags/v${ARCORE_VERSION}.zip" > download.zip
+unzip -q download.zip
 rm download.zip
+# The rest of the build looks for this folder name, so keep it even though it is a pinned release.
+mv "arcore-android-sdk-${ARCORE_VERSION}" "arcore-android-sdk-main"
