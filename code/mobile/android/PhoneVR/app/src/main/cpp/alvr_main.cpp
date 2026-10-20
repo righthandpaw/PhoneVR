@@ -106,6 +106,7 @@ constexpr float UPSCALING_EDGE_SHARPNESS = 2.0f;
 // The value scales the tangent of the half-angles, so 0.8 = about 25% zoom. The lobby is not
 // affected. Too small a value makes straight lines bend slightly toward the edges.
 // Tested on the Oppo Reno 9 A against the native client, which looked about 25% more zoomed in.
+// Default; the app's Settings screen can change it (see setStreamFovScaleNative).
 constexpr float STREAM_FOV_SCALE = 0.8f;
 const float FLOOR_HEIGHT = 1.5;
 const int MAXIMUM_TRACKING_FRAMES = 360;
@@ -152,6 +153,7 @@ constexpr int ARCORE_WORLD_UP_AXIS = 1;
 //   2 = like 1, but until a floor is found it assumes the headset started
 //       ARCORE_ASSUMED_START_HEIGHT_M above the floor, and it eases toward the measured floor
 //       height instead of jumping.
+// Default; the app's Settings screen can change it (see setFloorModeNative).
 constexpr int ARCORE_HEIGHT_MODE = 2;
 // Mode 2 only: assumed height above the floor at the start, before any floor has been detected.
 constexpr float ARCORE_ASSUMED_START_HEIGHT_M = 1.5f;
@@ -174,6 +176,9 @@ struct NativeContext {
     // concurrently, so every use of arSession is guarded by arMutex. ArSession_update() must
     // additionally run on the render thread, with the app's EGL context current.
     bool arcoreEnabled = false;
+    // Settings chosen on the app's Settings screen (the constants above are the defaults).
+    float streamFovScale = STREAM_FOV_SCALE;
+    int heightMode = ARCORE_HEIGHT_MODE;
     bool arSessionRunning = false;  // ArSession_resume() done and not yet paused; under arMutex
     int videoFramesSeen = 0;        // decoded frames since the stream started (render thread)
     ArSession *arSession = nullptr;
@@ -287,10 +292,10 @@ AlvrFov getFov(CardboardEye eye) {
 // keeps using getFov() directly. See STREAM_FOV_SCALE.
 AlvrFov getStreamFov(CardboardEye eye) {
     AlvrFov fov = getFov(eye);
-    fov.left = atanf(tanf(fov.left) * STREAM_FOV_SCALE);
-    fov.right = atanf(tanf(fov.right) * STREAM_FOV_SCALE);
-    fov.up = atanf(tanf(fov.up) * STREAM_FOV_SCALE);
-    fov.down = atanf(tanf(fov.down) * STREAM_FOV_SCALE);
+    fov.left = atanf(tanf(fov.left) * CTX.streamFovScale);
+    fov.right = atanf(tanf(fov.right) * CTX.streamFovScale);
+    fov.up = atanf(tanf(fov.up) * CTX.streamFovScale);
+    fov.down = atanf(tanf(fov.down) * CTX.streamFovScale);
     return fov;
 }
 
@@ -560,18 +565,18 @@ static void updateARCoreTracking() {
     ArPose_destroy(arPose);
     ArCamera_release(arCamera);
 
-    // Vertical position (see ARCORE_HEIGHT_MODE).
+    // Vertical position (see ARCORE_HEIGHT_MODE; the mode in use is CTX.heightMode).
     float headY = raw[5];
     float floorY = 0.0f;
     bool floorKnown = false;
-    if (ARCORE_HEIGHT_MODE != 0) {
+    if (CTX.heightMode != 0) {
         floorKnown = updateFloorAnchor(&floorY);
     }
-    if (ARCORE_HEIGHT_MODE == 1) {
+    if (CTX.heightMode == 1) {
         if (floorKnown) {
             headY = raw[5] - floorY;
         }
-    } else if (ARCORE_HEIGHT_MODE == 2) {
+    } else if (CTX.heightMode == 2) {
         if (floorKnown) {
             uint64_t blendDtNs = CTX.lastFloorBlendNs != 0 ? nowNs - CTX.lastFloorBlendNs : 0;
             if (blendDtNs > 0 && blendDtNs < ARCORE_MAX_CORRECTION_GAP_NS) {
@@ -813,6 +818,21 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_initia
             info("ARCore session created and configured");
         }
     }
+}
+
+// Settings from the app's Settings screen. Called right after initializeNative(), before the
+// stream starts.
+extern "C" JNIEXPORT void JNICALL
+Java_viritualisres_phonevr_ALVRActivity_setStreamFovScaleNative(JNIEnv *, jobject, jfloat scale) {
+    // Keep it in a sane range whatever was stored.
+    CTX.streamFovScale = std::min(1.0f, std::max(0.5f, (float) scale));
+    info("Setting: stream FOV scale %.2f", CTX.streamFovScale);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_viritualisres_phonevr_ALVRActivity_setFloorModeNative(JNIEnv *, jobject, jint mode) {
+    CTX.heightMode = (mode >= 0 && mode <= 2) ? (int) mode : ARCORE_HEIGHT_MODE;
+    info("Setting: ARCore floor/height mode %d", CTX.heightMode);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_destroyNative(JNIEnv *,

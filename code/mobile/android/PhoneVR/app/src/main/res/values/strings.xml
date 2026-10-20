@@ -43,4 +43,18 @@
     <string name="switch_phonevr_server">Switch PhoneVR Server</string>
     <string name="remember_choice">Remember choice</string>
     <string name="max_brightness">Max Brightness</string>
+    <string name="settings">Settings</string>
+    <string name="settings_title">PhoneVR settings</string>
+    <string name="settings_arcore">Use ARCore position tracking</string>
+    <string name="settings_arcore_hint">Lets you lean and move your head. Needs a phone that supports ARCore and uses the camera. Turn it off for rotation-only (3DoF) tracking.</string>
+    <string name="settings_fov">Zoom of the streamed picture (field of view)</string>
+    <string name="settings_fov_hint">100% shows exactly what the lens geometry says. Lower values zoom in and make text easier to read. 80% is the default.</string>
+    <string name="settings_floor">Height (floor) mode</string>
+    <string name="settings_floor_hint">How your head height is worked out when ARCore is on.</string>
+    <string name="settings_note">Changes are saved straight away and apply the next time you start VR.</string>
+    <string-array name="floor_mode_choices">
+        <item>0 - Relative to where tracking started</item>
+        <item>1 - Height above the detected floor</item>
+        <item>2 - Assumed start height, eased to the floor (default)</item>
+    </string-array>
 </resources>

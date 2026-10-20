@@ -68,6 +68,10 @@ class InitActivity : AppCompatActivity() {
         }
     }
 
+    fun btOnClickSettings(view: View) {
+        startActivity(Intent(this, SettingsActivity::class.java))
+    }
+
     fun btOnClickALVRStreamer(view: View) {
         val prefs = getSharedPreferences("prefs", MODE_PRIVATE)
         // Save choice after first open. alvr_server as boolean
