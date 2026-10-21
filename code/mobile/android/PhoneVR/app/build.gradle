@@ -16,10 +16,26 @@ keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
 
 def defaultALVRFlavour = "--release"
 
+// Part of the APK file name: PhoneVR-v<VERSION_NAME>-<releaseLabel>-<buildType>.apk
+// e.g. PhoneVR-v2.0.0-beta-ARcore-v21-release.apk (VERSION_NAME is set in ../version.properties)
+def releaseLabel = "ARcore-v21"
+
 android {
     signingConfigs {
         releaseconfig {
-            if( System.getenv('GITHUB_EVENT_NAME') == 'pull_request' || System.getenv("Store") == null || System.getenv("Key") == null ) {
+            // Your own release key. signing.properties is NOT committed (it is in .gitignore) and
+            // holds: storeFile, storePassword, keyAlias, keyPassword.
+            def localSigningFile = rootProject.file("signing.properties")
+            if (localSigningFile.exists()) {
+                def localSigning = new Properties()
+                localSigningFile.withInputStream { localSigning.load(it) }
+                storeFile file(localSigning['storeFile'])
+                storePassword localSigning['storePassword']
+                keyAlias localSigning['keyAlias']
+                keyPassword localSigning['keyPassword']
+                println "[PVR] Configuring releaseconfig with your own key from signing.properties"
+            }
+            else if( System.getenv('GITHUB_EVENT_NAME') == 'pull_request' || System.getenv("Store") == null || System.getenv("Key") == null ) {
                 // If its a PR Supply a dummy KeySigningConfig
                 // Or in Local env if Store and Keys are not present in ENV Vars do the same
                 storeFile file("PhoneVRKeyStorePR.jks")
@@ -27,6 +43,7 @@ android {
                 keyAlias "PhoneVRKeyPR"
                 keyPassword "test1234"
                 println "[PVR] Configuring releaseconfigs for testing a PR..."
+                println "[PVR] WARNING: this APK is signed with the public TEST key (no signing.properties). Do not share it."
             }
             else {
                 storeFile file(keystoreProperties['storeFile'])
@@ -85,6 +102,12 @@ android {
                 }
             }
             defaultALVRFlavour = ""
+        }
+    }
+    // APK file name, e.g. PhoneVR-v2.0.0-beta-ARcore-v21-release.apk
+    applicationVariants.all { variant ->
+        variant.outputs.all {
+            outputFileName = "PhoneVR-v${defaultConfig.versionName}-${releaseLabel}-${variant.buildType.name}.apk"
         }
     }
     buildFeatures {
