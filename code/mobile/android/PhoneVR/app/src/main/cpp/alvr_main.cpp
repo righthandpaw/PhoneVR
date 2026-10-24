@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "head_sensor_source.h"
 #include "utils.h"
 
 
@@ -145,6 +146,16 @@ const AlvrQuat ARCORE_TO_CARDBOARD = {-0.0057f, -0.0031f, 0.7076f, 0.7066f};
 // small (a few degrees); if it is large, this axis is probably wrong.
 constexpr int ARCORE_WORLD_UP_AXIS = 1;
 
+// ---- Own head orientation (replaces Cardboard's gyro tracker) ----
+// Mahony filter plus a stillness-based gyro bias estimator (head_orientation_filter.h), fed by
+// head_sensor_source.h. Cardboard's tracker drifts in yaw because it never measures the gyro's
+// constant offset; this does. The ARCore yaw correction below works on top of it unchanged.
+// Set to false to go back to Cardboard's tracker. Falls back to it until the first sensor data
+// arrives (or if the phone has no gyroscope).
+constexpr bool USE_OWN_HEAD_FILTER = true;
+// Once a second, while streaming: compare the own filter with Cardboard's tracker in the log.
+constexpr bool HEAD_FILTER_DEBUG_LOG = true;
+
 // ---- ARCore head height ----
 // How the vertical position is derived:
 //   0 = relative to where ARCore started (height starts at 0, as in the earlier builds).
@@ -169,6 +180,8 @@ struct NativeContext {
     jobject javaContext = nullptr;
 
     CardboardHeadTracker *headTracker = nullptr;
+    phonevr::HeadOrientationFilter headFilter;
+    phonevr::HeadSensorSource headSensors;
     CardboardLensDistortion *lensDistortion = nullptr;
     CardboardDistortionRenderer *distortionRenderer = nullptr;
 
@@ -345,17 +358,49 @@ static AlvrQuat worldYawQuat(float angleRad) {
     return {axis[0], axis[1], axis[2], c};
 }
 
-// Cardboard's orientation at the given time, in the same convention the rest of this file uses.
-static AlvrQuat cardboardOrientationAt(uint64_t timestampNs) {
+// Cardboard's own tracker, in the same convention the rest of this file uses.
+static AlvrQuat cardboardTrackerOrientationAt(uint64_t timestampNs) {
     float pos[3];
     float q[4];
     CardboardHeadTracker_getPose(CTX.headTracker, (int64_t) timestampNs, kLandscapeLeft, pos, q);
     return normalizeQuat(inverseQuat(AlvrQuat{q[0], q[1], q[2], q[3]}));
 }
 
+// The gyro-based orientation at the given time (before any ARCore yaw correction): our own
+// filter (USE_OWN_HEAD_FILTER), or Cardboard's tracker until the filter has data.
+static AlvrQuat cardboardOrientationAt(uint64_t timestampNs) {
+    if (USE_OWN_HEAD_FILTER && CTX.headFilter.ready()) {
+        phonevr::Quatd o = CTX.headFilter.orientationAt((int64_t) timestampNs);
+        return normalizeQuat(AlvrQuat{(float) o.x, (float) o.y, (float) o.z, (float) o.w});
+    }
+    return cardboardTrackerOrientationAt(timestampNs);
+}
+
+// Yaw (radians, about +y) of the direction the head faces (-z), for the log check below.
+static float facingYawRad(const AlvrQuat &q) {
+    float fx = -2.f * (q.x * q.z + q.w * q.y);
+    float fz = -(1.f - 2.f * (q.x * q.x + q.y * q.y));
+    return std::atan2(-fx, -fz);
+}
+
+// Angle (degrees) between the two orientations' "up" directions, as seen from the head. This is
+// pitch/roll only, so it ignores yaw. Close to 0 when the own filter's axes match Cardboard's.
+static float upVectorAngleDeg(const AlvrQuat &a, const AlvrQuat &b) {
+    auto up = [](const AlvrQuat &q, float v[3]) {
+        v[0] = 2.f * (q.x * q.y + q.w * q.z);
+        v[1] = 1.f - 2.f * (q.x * q.x + q.z * q.z);
+        v[2] = 2.f * (q.y * q.z - q.w * q.x);
+    };
+    float va[3], vb[3];
+    up(a, va);
+    up(b, vb);
+    float dot = std::clamp(va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2], -1.f, 1.f);
+    return std::acos(dot) * 180.f / (float) M_PI;
+}
+
 // Head pose, in world/tracking space (not head-relative). Safe to call from any thread.
 //
-// Orientation: Cardboard's fast gyro orientation, turned about the vertical by a slowly changing
+// Orientation: the fast gyro orientation (own filter, or Cardboard's), turned about the vertical by a slowly changing
 // yaw correction that the render thread computes from ARCore (updateARCoreTracking). Gyro drift
 // is a turn about the vertical, so this is what removes it.
 // Position: ARCore's last known position, or the origin until ARCore has tracked (3DoF).
@@ -721,12 +766,36 @@ void sendViewParams() {
     alvr_send_view_params(viewParams);
 }
 
+// Once a second: how the own head filter compares with Cardboard's tracker. "tilt diff" should
+// stay under a degree or two (a big value means the sensor axes are mapped wrongly). "yaw diff"
+// drifts slowly (that is the drift being removed); turn your head left and right: if it jumps
+// around instead of staying put, the yaw direction is mirrored.
+static void logHeadFilterCheck(uint64_t nowNs) {
+    static uint64_t lastNs = 0;
+    if (!USE_OWN_HEAD_FILTER || !HEAD_FILTER_DEBUG_LOG || !CTX.headFilter.ready()) {
+        return;
+    }
+    if (nowNs - lastNs < 1000000000ULL) {
+        return;
+    }
+    lastNs = nowNs;
+    AlvrQuat own = cardboardOrientationAt(nowNs);
+    AlvrQuat cardboard = cardboardTrackerOrientationAt(nowNs);
+    float yawDiffDeg = wrapRad(facingYawRad(own) - facingYawRad(cardboard)) * 180.f / (float) M_PI;
+    phonevr::HeadOrientationFilter::Diagnostics d = CTX.headFilter.diagnostics();
+    info("HeadFilter: tilt diff vs Cardboard %.2f deg, yaw diff %.1f deg | gyro bias (deg/s) "
+         "%.3f %.3f %.3f%s",
+         upVectorAngleDeg(own, cardboard), yawDiffDeg, d.biasDps[0], d.biasDps[1], d.biasDps[2],
+         d.biasReady ? "" : " (not measured yet: hold still)");
+}
+
 void inputThread() {
     auto deadline = std::chrono::steady_clock::now();
 
     info("inputThread: thread staring...");
     while (CTX.streaming) {
         auto targetTimestampNs = GetBootTimeNano() + ESTIMATED_PREDICTION_OFFSET_NS;
+        logHeadFilterCheck(targetTimestampNs);
 
         CTX.deviceMotion.device_id = HEAD_ID;
         CTX.deviceMotion.pose = getPose(targetTimestampNs);
@@ -840,6 +909,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_destro
     alvr_destroy_opengl();
     alvr_destroy();
 
+    CTX.headSensors.stop();
     CardboardHeadTracker_destroy(CTX.headTracker);
     CTX.headTracker = nullptr;
     CardboardLensDistortion_destroy(CTX.lensDistortion);
@@ -868,6 +938,9 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_destro
 extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_resumeNative(JNIEnv *,
                                                                                        jobject) {
     CardboardHeadTracker_resume(CTX.headTracker);
+    if (USE_OWN_HEAD_FILTER) {
+        CTX.headSensors.start(&CTX.headFilter);
+    }
 
     if (!ARCORE_START_AFTER_VIDEO) {
         startARCoreSession("app resumed");
@@ -900,6 +973,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_pauseN
     }
 
     CardboardHeadTracker_pause(CTX.headTracker);
+    CTX.headSensors.stop();
 
     // Releases the camera. (The v20 code never paused the ARCore session.)
     stopARCoreSession("app paused");
