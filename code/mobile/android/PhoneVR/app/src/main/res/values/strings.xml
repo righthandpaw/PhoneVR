@@ -24,8 +24,8 @@
     <string name="log">Log</string>
     <string name="pick_logfile">Pick a log file to open</string>
     <string name="use_phonevr_legacy_streamer">Use PhoneVR(GoogleVR API) legacy Server</string>
-    <string name="use_alvr_streamer_recommended">Use ALVR(Cardboard API) Server (recommended)</string>
-    <string name="phonevr_support_common">PhoneVR supports two VR packages, ALVR-CardboardAPI or PhoneVR-GvrAPI. You can read more about these packages in https://github.com/PhoneVR-Developers/PhoneVR#readme.</string>
+    <string name="use_alvr_streamer_recommended">Connect to ALVR Server</string>
+    <string name="phonevr_support_common">This fork of PhoneVR is only compatible with ALVR 21.0.0-dev14</string>
     <string-array name="logsFiles">
         <item>pvrlog.txt</item>
         <item>pvrDebuglog.txt</item>
@@ -40,7 +40,7 @@
     <string name="switch_viewer">
             Switch Cardboard viewer
     </string>
-    <string name="switch_phonevr_server">Switch PhoneVR Server</string>
+    <string name="switch_phonevr_server">PhoneVR Settings</string>
     <string name="remember_choice">Remember choice</string>
     <string name="max_brightness">Max Brightness</string>
     <string name="settings">Settings</string>

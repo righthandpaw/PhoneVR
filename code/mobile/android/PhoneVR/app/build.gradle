@@ -126,7 +126,8 @@ android {
         }
         noGvr {
             dimension "gvr"
-            versionNameSuffix "-nogvr"
+            //versionNameSuffix "-nogvr"
+            versionNameSuffix ""
         }
     }
     sourceSets {
