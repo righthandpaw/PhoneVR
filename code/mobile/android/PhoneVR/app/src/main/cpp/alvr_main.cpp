@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "head_sensor_source.h"
+#include "neck_model.h"
 #include "utils.h"
 
 
@@ -156,6 +157,17 @@ constexpr bool USE_OWN_HEAD_FILTER = true;
 // Once a second, while streaming: compare the own filter with Cardboard's tracker in the log.
 constexpr bool HEAD_FILTER_DEBUG_LOG = true;
 
+// ---- Neck model (seated 3DoF) ----
+// Without ARCore there is no position, so the view is glued to one point. With this on, pitching
+// or rolling the head moves the eyes a few centimetres, as it does on a real neck (see
+// neck_model.h). Only used when ARCore is off; ARCore's real position replaces it. Turning the
+// head left or right is deliberately ignored.
+constexpr bool NECK_MODEL_ENABLED = true;
+// Where the eyes are relative to the neck pivot, in metres (rough adult average; per-user
+// setting later).
+constexpr float NECK_EYE_UP_M = 0.09f;
+constexpr float NECK_EYE_FORWARD_M = 0.08f;
+
 // ---- ARCore head height ----
 // How the vertical position is derived:
 //   0 = relative to where ARCore started (height starts at 0, as in the earlier builds).
@@ -182,6 +194,7 @@ struct NativeContext {
     CardboardHeadTracker *headTracker = nullptr;
     phonevr::HeadOrientationFilter headFilter;
     phonevr::HeadSensorSource headSensors;
+    float neckLastYawRad = 0.f;  // heading held while looking straight up/down; under poseMutex
     CardboardLensDistortion *lensDistortion = nullptr;
     CardboardDistortionRenderer *distortionRenderer = nullptr;
 
@@ -420,6 +433,14 @@ AlvrPose getPose(uint64_t timestampNs) {
         if (ARCORE_USE_POSITION && CTX.arPositionValid) {
             for (int i = 0; i < 3; i++) {
                 pose.position[i] = CTX.arPosition[i];
+            }
+        } else if (NECK_MODEL_ENABLED && !CTX.arcoreEnabled) {
+            float offset[3];
+            phonevr::neckModelOffset(orientation.x, orientation.y, orientation.z, orientation.w,
+                                     NECK_EYE_UP_M, NECK_EYE_FORWARD_M, CTX.neckLastYawRad,
+                                     offset);
+            for (int i = 0; i < 3; i++) {
+                pose.position[i] = offset[i];
             }
         }
     }
