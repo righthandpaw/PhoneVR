@@ -32,6 +32,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -78,9 +79,11 @@ public:
 
 private:
     static constexpr const char *kTag = "PhoneVR_MarkerSpike";
-    template <typename... A>
-    static void logi(const char *fmt, A... args) {
-        __android_log_print(ANDROID_LOG_INFO, kTag, fmt, args...);
+    __attribute__((format(printf, 1, 2))) static void logi(const char *fmt, ...) {
+        va_list ap;
+        va_start(ap, fmt);
+        __android_log_vprint(ANDROID_LOG_INFO, kTag, fmt, ap);
+        va_end(ap);
     }
 
     Config cfg_;
