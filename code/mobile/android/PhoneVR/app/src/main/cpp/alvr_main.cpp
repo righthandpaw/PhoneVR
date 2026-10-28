@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "head_sensor_source.h"
+#include "marker_spike.h"
 #include "neck_model.h"
 #include "utils.h"
 
@@ -157,6 +158,12 @@ constexpr bool USE_OWN_HEAD_FILTER = true;
 // Once a second, while streaming: compare the own filter with Cardboard's tracker in the log.
 constexpr bool HEAD_FILTER_DEBUG_LOG = true;
 
+// ---- Marker tracking spike (experimental, stage 1) ----
+// Opens the back camera and runs AprilTag detection, logging speed and detections only (logcat
+// tag PhoneVR_MarkerSpike). Does not affect tracking. Needs ARCore OFF (both want the camera) and
+// the Camera permission.
+constexpr bool MARKER_SPIKE_ENABLED = true;
+
 // ---- Neck model (seated 3DoF) ----
 // Without ARCore there is no position, so the view is glued to one point. With this on, pitching
 // or rolling the head moves the eyes a few centimetres, as it does on a real neck (see
@@ -194,6 +201,7 @@ struct NativeContext {
     CardboardHeadTracker *headTracker = nullptr;
     phonevr::HeadOrientationFilter headFilter;
     phonevr::HeadSensorSource headSensors;
+    phonevr::MarkerSpike markerSpike;
     float neckLastYawRad = 0.f;  // heading held while looking straight up/down; under poseMutex
     CardboardLensDistortion *lensDistortion = nullptr;
     CardboardDistortionRenderer *distortionRenderer = nullptr;
@@ -931,6 +939,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_destro
     alvr_destroy();
 
     CTX.headSensors.stop();
+    CTX.markerSpike.stop();
     CardboardHeadTracker_destroy(CTX.headTracker);
     CTX.headTracker = nullptr;
     CardboardLensDistortion_destroy(CTX.lensDistortion);
@@ -961,6 +970,9 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_resume
     CardboardHeadTracker_resume(CTX.headTracker);
     if (USE_OWN_HEAD_FILTER) {
         CTX.headSensors.start(&CTX.headFilter);
+    }
+    if (MARKER_SPIKE_ENABLED && !CTX.arcoreEnabled) {
+        CTX.markerSpike.start();
     }
 
     if (!ARCORE_START_AFTER_VIDEO) {
@@ -995,6 +1007,7 @@ extern "C" JNIEXPORT void JNICALL Java_viritualisres_phonevr_ALVRActivity_pauseN
 
     CardboardHeadTracker_pause(CTX.headTracker);
     CTX.headSensors.stop();
+    CTX.markerSpike.stop();
 
     // Releases the camera. (The v20 code never paused the ARCore session.)
     stopARCoreSession("app paused");
